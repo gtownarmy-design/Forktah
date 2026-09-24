@@ -121,6 +121,22 @@ elif cmd == 'display-message':
     for posture in ('read-only', 'unrestricted'):
         assert (root / 'home/claude-config' / ('parallel-'+posture) / 'settings.json').exists()
     check('concurrent different-posture spawns retain separate configs; GC prunes only dead agents')
+    # No CLAUDE_CONFIG_DIR: Claude's account state is ~/.claude.json, outside the dir
+    # the mirror links from, and an unseeded agent opens at the login-method picker.
+    # Only account and onboarding keys may cross; history and MCP servers may not.
+    home = root / 'op-home'; (home / '.claude').mkdir(parents=True)
+    (home / '.claude' / 'settings.json').write_text('{}')
+    account = {'emailAddress': 'operator@example.invalid'}
+    (home / '.claude.json').write_text(json.dumps({'oauthAccount': account, 'userID': 'u1',
+        'hasCompletedOnboarding': True, 'projects': {'/private': {'history': ['x']}},
+        'mcpServers': {'operator-only': {'command': 'x'}}}))
+    run('seeded', '--cli', 'claude', extra={'CLAUDE_CONFIG_DIR': '', 'HOME': str(home)})
+    seeded = root / 'home/claude-config/seeded/.claude.json'
+    assert not seeded.is_symlink() and seeded.stat().st_mode & 0o777 == 0o600
+    assert json.loads(seeded.read_text()) == {'oauthAccount': account, 'userID': 'u1',
+                                              'hasCompletedOnboarding': True}
+    assert not (root / 'home/claude-config/claude-unrestricted/.claude.json').exists()
+    check('without CLAUDE_CONFIG_DIR, only account/onboarding keys seed a private .claude.json')
     # Corrupt the actual published file between generation and readback. The
     # prove-it gate must catch this, rather than checking the intended object.
     mv = bindir / 'mv'

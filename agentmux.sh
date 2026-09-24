@@ -135,6 +135,26 @@ claude_config_dir() {
       [ -e "$d/$base" ] || ln -s "$entry" "$d/$base" 2>/dev/null
     done
   fi
+  # Account and onboarding state. With CLAUDE_CONFIG_DIR set, Claude keeps
+  # .claude.json inside the config dir and the loop above links it. Without it the
+  # file is ~/.claude.json, outside $src, and a spawned agent opens at the theme and
+  # login-method pickers instead of a prompt. Seed a private copy holding only the
+  # account and onboarding keys: never the operator's project history or the
+  # user-scoped MCP servers, which the settings copy below strips for the same reason.
+  if [ "$src" = "$HOME/.claude" ] && [ -f "$HOME/.claude.json" ] && [ ! -e "$d/.claude.json" ]; then
+    python3 - "$HOME/.claude.json" "$d/.claude.json" <<'PYSEED' || return 1
+import json, os, sys
+src, dst = sys.argv[1:]
+try:
+    cfg = json.load(open(src))
+except (OSError, ValueError):
+    sys.exit(0)  # no usable state to seed; Claude will onboard as before
+keep = ('oauthAccount', 'userID', 'hasCompletedOnboarding', 'lastOnboardingVersion', 'theme')
+fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, 'w') as out:
+    json.dump({k: cfg[k] for k in keep if k in cfg}, out, indent=2)
+PYSEED
+  fi
   tmp="$(mktemp "$d/.settings.XXXXXX")" || return 1
   if ! python3 - "$src/settings.json" "$tmp" "$posture" "$tools" "$deny_tools" <<'PYCFG'
 import json, pathlib, sys
