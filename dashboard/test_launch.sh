@@ -37,7 +37,12 @@ elif cmd == 'display-message':
     tmux.chmod(0o755)
     for name, body in [('sleep', 'exit 0'), ('claude', 'echo "--restricted --strict-mcp-config"')]:
         path = bindir / name; path.write_text('#!/bin/sh\n' + body + '\n'); path.chmod(0o755)
+    # AGENTMUX_IDLE_MINUTES=0: every spawn otherwise arms a detached idle watchdog that,
+    # seeing the fake tmux report live sessions, appends to home/run/.idle.log every 60 s.
+    # A run that lasts about a minute (the full gate under load) then has a tick land
+    # during TemporaryDirectory cleanup: "Directory not empty". Idle is test_idle.sh's.
     env = dict(os.environ, AGENTMUX_HOME=str(root / 'home'), AGENTMUX_NO_COURIER='1',
+               AGENTMUX_IDLE_MINUTES='0',
                CLAUDE_CONFIG_DIR=str(src), FAKE_STATE=str(state), PATH=str(bindir)+':'+os.environ['PATH'])
     env.pop('AGENTMUX_NO_BYPASS', None)
     counter = 0
