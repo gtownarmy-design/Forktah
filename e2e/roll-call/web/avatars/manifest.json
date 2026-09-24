@@ -1,0 +1,32 @@
+{
+  "avatars": [
+    {
+      "file": "conductor.svg",
+      "agent": "conductor",
+      "model": "grok-4.7",
+      "intent": "Five bars on one stage, the center bar gold and tallest, show the orchestrator setting the beat the others follow.",
+      "palette": ["#12141c", "#232838", "#f6f1e6", "#f5c451"]
+    },
+    {
+      "file": "developer.svg",
+      "agent": "developer",
+      "model": "grok-4.7",
+      "intent": "A cream pair of angle brackets with a teal slash between them shows the full-stack developer writing code.",
+      "palette": ["#12141c", "#232838", "#f6f1e6", "#2fbfa8"]
+    },
+    {
+      "file": "imager.svg",
+      "agent": "imager",
+      "model": "grok-4.7",
+      "intent": "Violet viewfinder corners around a gold focus ring show the image generator framing a picture.",
+      "palette": ["#12141c", "#232838", "#9b7cff", "#f5c451"]
+    },
+    {
+      "file": "reviewer.svg",
+      "agent": "reviewer",
+      "model": "grok-4.7",
+      "intent": "A coral seal of two rings and a cream check shows the final reviewer marking the work approved.",
+      "palette": ["#12141c", "#232838", "#ff5d6c", "#f6f1e6"]
+    }
+  ]
+}
