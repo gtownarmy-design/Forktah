@@ -88,7 +88,7 @@
         { "id": "installed", "label": "installed", "type": "command",
           "argv": ["grok", "--version"], "expect": "grok" },
         { "id": "auth", "label": "logged in", "type": "command",
-          "argv": ["grok", "models"], "expect": "logged in" },
+          "argv": ["grok", "models"], "expect": "logged in", "timeout": 30 },
         { "id": "shared-auth", "label": "auth shared with Windows", "type": "file",
           "path": "~/.grok/auth.json" }
       ],
@@ -113,17 +113,22 @@
       "checks": [
         { "id": "installed", "label": "installed", "type": "command",
           "argv": ["claude", "--version"], "expect": "Claude Code" },
-        { "id": "creds", "label": "WSL credentials present", "type": "file",
-          "path": "~/.claude-wsl/.credentials.json" },
-        { "id": "agent-config", "label": "spawned-agent config dir built", "type": "file",
-          "path": "~/.agentmux/claude-config/settings.json" }
+        { "id": "signed-in", "label": "signed in (claude auth status)", "type": "command",
+          "argv": ["claude", "auth", "status"], "expect": "\"loggedIn\":\\s*true", "timeout": 30,
+          "_note": "Asks Claude Code itself, so it holds for any config layout: CLAUDE_CONFIG_DIR set or not, OAuth or API key. A file check names one machine's path." },
+        { "id": "subscription", "label": "subscription sign-in, not an API key", "type": "command",
+          "argv": ["claude", "auth", "status"], "expect": "\"authMethod\":\\s*\"claude\\.ai\"", "timeout": 30,
+          "optional": true },
+        { "id": "agent-config", "label": "spawned-agent config root", "type": "file",
+          "path": "~/.agentmux/claude-config", "optional": true,
+          "_note": "Each spawned claude agent gets its own mirror under this root, built at spawn and pruned when the agent dies." }
       ],
       "actions": [
         { "id": "login", "label": "Log in (interactive)", "command": "claude", "secret": true,
           "note": "Run claude, then /login. Windows keeps its login in the DPAPI credential store, which Linux cannot read — no symlink can share it." }
       ],
       "notes": [
-        "The effective config dir is ~/.claude-wsl via CLAUDE_CONFIG_DIR, not ~/.claude. Add MCP servers with --scope user AND that variable set, or they land at project scope in a file spawned agents never read."
+        "Spawned agents get a per-agent CLAUDE_CONFIG_DIR that mirrors the effective config dir (CLAUDE_CONFIG_DIR if set, else ~/.claude). Without CLAUDE_CONFIG_DIR, the account and onboarding keys of ~/.claude.json are seeded into each mirror so an agent starts signed in."
       ]
     },
 

@@ -133,15 +133,20 @@ elif cmd == 'display-message':
     (home / '.claude' / 'settings.json').write_text('{}')
     account = {'emailAddress': 'operator@example.invalid'}
     (home / '.claude.json').write_text(json.dumps({'oauthAccount': account, 'userID': 'u1',
-        'hasCompletedOnboarding': True, 'projects': {'/private': {'history': ['x']}},
+        'hasCompletedOnboarding': True,
+        'projects': {'/private': {'history': ['x'], 'hasTrustDialogAccepted': True,
+                                  'allowedTools': ['Bash']},
+                     '/untrusted': {'history': ['y'], 'hasTrustDialogAccepted': False}},
         'mcpServers': {'operator-only': {'command': 'x'}}}))
     run('seeded', '--cli', 'claude', extra={'CLAUDE_CONFIG_DIR': '', 'HOME': str(home)})
     seeded = root / 'home/claude-config/seeded/.claude.json'
     assert not seeded.is_symlink() and seeded.stat().st_mode & 0o777 == 0o600
+    # Trust crosses only where the operator granted it, and as the bare flag: no
+    # history, no per-project tool grants, nothing for folders left untrusted.
     assert json.loads(seeded.read_text()) == {'oauthAccount': account, 'userID': 'u1',
-                                              'hasCompletedOnboarding': True}
+        'hasCompletedOnboarding': True, 'projects': {'/private': {'hasTrustDialogAccepted': True}}}
     assert not (root / 'home/claude-config/claude-unrestricted/.claude.json').exists()
-    check('without CLAUDE_CONFIG_DIR, only account/onboarding keys seed a private .claude.json')
+    check('without CLAUDE_CONFIG_DIR, only account/onboarding keys and granted folder trust seed a private .claude.json')
     # Corrupt the actual published file between generation and readback. The
     # prove-it gate must catch this, rather than checking the intended object.
     mv = bindir / 'mv'

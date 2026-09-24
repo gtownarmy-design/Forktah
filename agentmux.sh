@@ -141,6 +141,9 @@ claude_config_dir() {
   # login-method pickers instead of a prompt. Seed a private copy holding only the
   # account and onboarding keys: never the operator's project history or the
   # user-scoped MCP servers, which the settings copy below strips for the same reason.
+  # Folder trust is the one per-project fact carried over, and only where the operator
+  # already granted it: the linked layout inherits exactly that, and without it every
+  # dispatched agent stops at "trust this folder?" with "No, exit" preselected.
   if [ "$src" = "$HOME/.claude" ] && [ -f "$HOME/.claude.json" ] && [ ! -e "$d/.claude.json" ]; then
     python3 - "$HOME/.claude.json" "$d/.claude.json" <<'PYSEED' || return 1
 import json, os, sys
@@ -152,7 +155,13 @@ except (OSError, ValueError):
 keep = ('oauthAccount', 'userID', 'hasCompletedOnboarding', 'lastOnboardingVersion', 'theme')
 fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 with os.fdopen(fd, 'w') as out:
-    json.dump({k: cfg[k] for k in keep if k in cfg}, out, indent=2)
+    seed = {k: cfg[k] for k in keep if k in cfg}
+    trusted = {path: {'hasTrustDialogAccepted': True}
+               for path, project in (cfg.get('projects') or {}).items()
+               if isinstance(project, dict) and project.get('hasTrustDialogAccepted') is True}
+    if trusted:
+        seed['projects'] = trusted
+    json.dump(seed, out, indent=2)
 PYSEED
   fi
   tmp="$(mktemp "$d/.settings.XXXXXX")" || return 1
