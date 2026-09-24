@@ -57,19 +57,41 @@ The app is also the product of an end-to-end coordination exercise: four agents 
 | `rollcall-imager` | worker | grok | `web/avatars/` |
 | `rollcall-reviewer` | reviewer | grok | the gate: `run verdict`; never edits |
 
-From the repository root, inside WSL:
+From the repository root, inside WSL, in a checkout where the app files have been removed
+(everything but `BRIEF.md`) so the agents have something to build:
 
 ```sh
+agentmux courier start                          # delivers `agentmux post` messages
 R=$(agentmux run start "Rebuild e2e/roll-call from BRIEF.md")
-for a in lead dev imager reviewer; do
-  agentmux spawn rollcall-$a --agentdef rollcall-$a --cwd "$PWD/e2e/roll-call"
-done
-agentmux run assign "$R" --worker rollcall-dev    --reviewer rollcall-reviewer --brief "server, page, tests, README per BRIEF.md"
-agentmux run assign "$R" --worker rollcall-imager --reviewer rollcall-reviewer --brief "four SVG avatars + manifest per BRIEF.md"
+python3 e2e/roll-call/spawn_team.py             # resolves each definition, then spawns it
+J1=$(agentmux run assign "$R" --worker rollcall-dev    --reviewer rollcall-reviewer --brief "server, page, tests, README per BRIEF.md")
+J2=$(agentmux run assign "$R" --worker rollcall-imager --reviewer rollcall-reviewer --brief "four SVG avatars + manifest per BRIEF.md")
+# answer first-run prompts (below), then send each agent its kickoff (below)
 agentmux run status "$R"      # one line per job
 agentmux run complete "$R"    # refuses until the reviewer has passed every job
 agentmux run teardown "$R"
 ```
+
+What the first real run (2026-09-24, run `0cb4e1`) showed:
+
+- **Spawn through `spawn_team.py`, not `spawn --agentdef` alone.** `--agentdef` only records which
+  definition a pane came from. The script passes the definition's cli, posture, role and persona,
+  as the dashboard's hire does.
+- **Claude's first run in a fresh agent config asks where the folder is trusted,** and the
+  default is *No, exit*. Answer with `agentmux key <name> Down`, check with `agentmux read`, then
+  `agentmux key <name> Enter`. Grok shows a data-sharing banner that needs no answer.
+- **Nothing tells an agent its persona or job.** The persona reaches the pane only as the file
+  named by `$AGENTMUX_PERSONA_FILE`, `run assign` records a brief without delivering it, and
+  `$AGENTMUX_JOB` is unset for hand-spawned agents. The first `agentmux send` to each agent says:
+  read `$AGENTMUX_PERSONA_FILE` and `BRIEF.md`, this is your job id, and this is who you report to.
+- **Killing the last agent stops the courier.** Start it again before the next kickoff.
+- **`run teardown` closes only the agents named in the run's jobs** (workers and reviewers). The
+  lead is in no job, so stop it yourself: `agentmux kill rollcall-lead`.
+
+In that run the lead briefed both workers through the courier. The reviewer passed both jobs on
+the first try, and `run complete` accepted 2/2. The rebuilt app passed 6 of its own
+`node --test` checks, with four valid SVG avatars. The commit is on the Forktah branch
+`rollcall-run-20260924`.
 
 Coordination uses agentmux's own primitives: `claim`/`release` before editing, `post --kind
 request|reply|finding|status` between agents, `journal` for decisions, `run submit` from a worker
