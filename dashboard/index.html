@@ -305,12 +305,16 @@
             <label class="toggle" title="Place epic cards anywhere by dragging their header. Off, they flow in a column grid.">
               <input type="checkbox" id="boardFree"> free layout
             </label>
+            <label class="toggle" title="Hide finished tasks, and finished epics with nothing left in them. Remembered in this browser.">
+              <input type="checkbox" id="boardHideDone" checked> hide done
+            </label>
             <button id="boardTidy" class="btn" title="Return every epic card to the grid. In free layout this is the only thing that moves them.">tidy</button>
             <button id="boardExpand" class="btn">expand all</button>
             <button id="boardCollapse" class="btn">collapse all</button>
           </div>
           <div id="dispatchStrip" class="dispatch-strip" aria-live="polite"></div>
           <div id="boardList" class="board"></div>
+          <aside id="taskDetail" class="task-detail" aria-live="polite" aria-label="Task details" hidden></aside>
           <p class="hint">
             Drag a task onto another epic to refile it — that goes through
             <code>/api/board/move</code> and is real state, visible to the CLI and to

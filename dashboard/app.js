@@ -98,6 +98,8 @@ const els = {
   epicJira:   document.getElementById('epicJira'),
   epicAdd:    document.getElementById('epicAdd'),
   boardFree:     document.getElementById('boardFree'),
+  boardHideDone: document.getElementById('boardHideDone'),
+  taskDetail:    document.getElementById('taskDetail'),
   boardTidy:     document.getElementById('boardTidy'),
   boardExpand:   document.getElementById('boardExpand'),
   boardCollapse: document.getElementById('boardCollapse'),
@@ -2923,6 +2925,15 @@ const BOARD_FREE_KEY = 'ccc.boardFree';
 let boardFree = false;
 try { boardFree = localStorage.getItem(BOARD_FREE_KEY) === '1'; } catch (_) {}
 
+// Hide finished work. A board with a history is mostly done cards, and a view that
+// lists all of them buries the few that are not. On by default; the choice is this
+// browser's, like free layout. An epic that is itself resolved and has nothing left
+// to show is hidden with its tasks.
+const BOARD_HIDE_DONE_KEY = 'ccc.boardHideDone';
+const RESOLVED_STATUSES = new Set(['done', 'deleted']);
+let boardHideDone = true;
+try { boardHideDone = localStorage.getItem(BOARD_HIDE_DONE_KEY) !== '0'; } catch (_) {}
+
 function boardPlacements() {
   try {
     const parsed = JSON.parse(localStorage.getItem(BOARD_PLACE_KEY) || '{}');
@@ -3022,6 +3033,75 @@ function setEpicsOpen(open) {
   }
 }
 
+// The card, in full. The list shows one line per task; everything a ticket gathers -
+// its criteria, evidence, comments and history - is read here on demand, so the list
+// stays one request. Every field goes in through textContent: a ticket body is text
+// somebody typed, and nothing typed is ever parsed as markup.
+let detailKey = null;
+
+async function showTaskDetail(key) {
+  const pane = els.taskDetail;
+  if (!pane) return;
+  detailKey = key;
+  pane.hidden = false;
+  pane.replaceChildren(el('p', 'stamp', `loading ${key}…`));
+  try {
+    const id = encodeURIComponent(key);
+    const [task, hist] = await Promise.all([
+      getJSON(`api/board/entity?id=${id}`),
+      getJSON(`api/board/history?id=${id}&limit=100`)]);
+    if (detailKey !== key) return;           // a later click owns the pane
+    pane.replaceChildren(...renderTaskDetail(task, (hist && hist.events) || []));
+  } catch (err) {
+    if (detailKey === key) pane.replaceChildren(el('p', 'stamp', `${key} unavailable: ${err.message}`));
+  }
+}
+
+function closeTaskDetail() {
+  detailKey = null;
+  if (!els.taskDetail) return;
+  els.taskDetail.hidden = true;
+  els.taskDetail.replaceChildren();
+}
+
+function detailSection(title, items, render) {
+  const box = el('section', 'td-section');
+  box.appendChild(el('h4', 'td-h', `${title} (${items.length})`));
+  if (!items.length) box.appendChild(el('p', 'td-empty', 'none'));
+  for (const item of items) box.appendChild(render(item));
+  return box;
+}
+
+function renderTaskDetail(t, events) {
+  const head = el('div', 'td-head');
+  const close = el('button', 'cbtn td-close', 'close');
+  close.type = 'button';
+  close.addEventListener('click', closeTaskDetail);
+  head.append(el('span', 'board-key', String(t.key || '')), el('span', 'td-title', String(t.title || '')),
+              el('span', 'td-status', String(t.status || '')), el('span', 'spacer'), close);
+  const facts = [t.epic && `epic ${t.epic}`, t.assignee && `assignee ${t.assignee}`,
+                 t.created && `created ${String(t.created).slice(0, 16)}`,
+                 t.closed && `closed ${String(t.closed).slice(0, 16)}`,
+                 t.parkedReason && `parked: ${t.parkedReason}`,
+                 t.blockedReason && `blocked: ${t.blockedReason}`].filter(Boolean);
+  return [
+    head,
+    el('p', 'td-meta', facts.join(' · ')),
+    el('pre', 'td-body', String(t.body || '')),
+    detailSection('Acceptance criteria', t.acceptance || [],
+      (a) => el('div', a.done ? 'td-ac done' : 'td-ac', `${a.done ? '✓' : '○'} ${a.text}`)),
+    detailSection('Evidence', t.evidence || [], (ref) => el('code', 'td-ref', String(ref))),
+    detailSection('Comments', t.comments || [], (c) => {
+      const box = el('div', 'td-comment');
+      box.append(el('span', 'td-when', `${String(c.ts || '').slice(0, 16)} ${c.author || ''}`),
+                 el('pre', 'td-text', String(c.text || '')));
+      return box;
+    }),
+    detailSection('History', events, (h) => el('div', 'td-event',
+      `${String(h.ts || '').slice(0, 16)} ${h.event}${h.actor ? ' · ' + h.actor : ''}`)),
+  ];
+}
+
 async function loadBoard() {
   loadDispatch();
   try {
@@ -3031,10 +3111,20 @@ async function loadBoard() {
     const epicKeys = new Set(epics.map((e) => e.key));
     const ungrouped = allTasks.filter((t) => !epicKeys.has(t.epic));
     const groups = ungrouped.length ? [...epics, { title: 'Tasks without an epic' }] : epics;
+    const visible = (t) => !boardHideDone || !RESOLVED_STATUSES.has(t.status);
+    let hiddenTasks = 0;
+    let shownGroups = 0;
     els.boardList.replaceChildren();
     if (!groups.length) els.boardList.appendChild(el('p', 'empty', 'No epics yet. Add one above.'));
 
     for (const e of groups) {
+      const all = e.key ? allTasks.filter((t) => t.epic === e.key) : ungrouped;
+      const shown = all.filter(visible);
+      hiddenTasks += all.length - shown.length;
+      // A finished epic with nothing unfinished in it is history; a keyless pile
+      // with nothing to show is not a group at all.
+      if (!shown.length && (!e.key || (boardHideDone && RESOLVED_STATUSES.has(e.status)))) continue;
+      shownGroups += 1;
       // Epics default OPEN: a board that opens collapsed hides the work. The
       // operator's own choice per epic is remembered, as everywhere else.
       const card = collapsible(`board:epic:${e.key || 'none'}`, 'epic', true);
@@ -3047,15 +3137,18 @@ async function loadBoard() {
       if (e.key) head.appendChild(el('span', 'board-key', e.key));
       head.appendChild(el('span', 'epic-title', String(e.title || '(untitled)')));
       if (e.jira_key) head.appendChild(el('span', 'epic-meta', String(e.jira_key)));
-      const tasks = e.key ? allTasks.filter((t) => t.epic === e.key) : ungrouped;
-      const done = tasks.filter((t) => t.status === 'done').length;
-      if (tasks.length) head.appendChild(el('span', 'epic-meta', `${done}/${tasks.length}`));
+      const tasks = shown;
+      const done = all.filter((t) => t.status === 'done').length;
+      if (all.length) head.appendChild(el('span', 'epic-meta', `${done}/${all.length}`));
       // An epic is "running" when something inside it is. Put it on the SUMMARY so a
       // collapsed card still says so - otherwise the one signal worth seeing is the
-      // one hidden behind the disclosure that made the board readable.
+      // one hidden behind the disclosure that made the board readable. A finished
+      // task's assignee does not count: most history is assigned to a name that is
+      // live again today, and every old epic would light up with it.
       const busy = new Set();
       for (const [name, agent] of liveAgents) {
-        if (tasks.some((t) => t.key === agent.task || t.assignee === name)) busy.add(name);
+        if (all.some((t) => t.key === agent.task
+                           || (t.assignee === name && !RESOLVED_STATUSES.has(t.status)))) busy.add(name);
       }
       for (const name of [...busy].sort()) {
         head.appendChild(markAgent(el('span', 'epic-agent', name), name));
@@ -3090,9 +3183,16 @@ async function loadBoard() {
         r.appendChild(el('span', 'board-key', t.key));
         r.appendChild(statusSelect('task', t.key, t.status, TASK_STATUSES,
                                    loadBoard, els.boardStamp));
-        r.appendChild(el('span', 't-title', String(t.title || '')));
+        const title = el('button', 't-title', String(t.title || ''));
+        title.type = 'button';
+        title.title = 'Show criteria, evidence, comments and history';
+        title.addEventListener('click', () => showTaskDetail(t.key));
+        r.appendChild(title);
         if (t.assignee) {
-          r.appendChild(markAgent(el('span', 't-agent', String(t.assignee)), t.assignee));
+          // Tagged for the live pass only while the task is unfinished, for the same
+          // reason the epic's busy check above ignores finished tasks.
+          const who = el('span', 't-agent', String(t.assignee));
+          r.appendChild(RESOLVED_STATUSES.has(t.status) ? who : markAgent(who, t.assignee));
         }
         // An agent can be bound to a card from ITS side - the `.task` sidecar -
         // without the card naming it back. That is the normal shape during a run,
@@ -3159,10 +3259,14 @@ async function loadBoard() {
 
       els.boardList.appendChild(card);
     }
+    if (groups.length && !shownGroups) {
+      els.boardList.appendChild(el('p', 'empty', 'Nothing unfinished. Untick "hide done" to see the history.'));
+    }
     applyBoardFree();
     refreshLiveMarks(els.boardList);
     say(els.boardStamp, `${epics.length} epic${epics.length === 1 ? '' : 's'}`
-      + `, ${allTasks.length} task${allTasks.length === 1 ? '' : 's'}`);
+      + `, ${allTasks.length} task${allTasks.length === 1 ? '' : 's'}`
+      + (hiddenTasks ? `, ${hiddenTasks} done hidden` : ''));
   } catch (err) {
     say(els.boardStamp, `board unavailable: ${err.message}`);
   }
@@ -3749,6 +3853,14 @@ if (els.boardFree) {
     boardFree = els.boardFree.checked;
     try { localStorage.setItem(BOARD_FREE_KEY, boardFree ? '1' : '0'); } catch (_) {}
     applyBoardFree();
+  });
+}
+if (els.boardHideDone) {
+  els.boardHideDone.checked = boardHideDone;
+  els.boardHideDone.addEventListener('change', () => {
+    boardHideDone = els.boardHideDone.checked;
+    try { localStorage.setItem(BOARD_HIDE_DONE_KEY, boardHideDone ? '1' : '0'); } catch (_) {}
+    loadBoard();
   });
 }
 if (els.boardTidy) els.boardTidy.addEventListener('click', () => {

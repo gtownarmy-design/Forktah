@@ -257,6 +257,75 @@ await test('the stamp counts both epics and tasks',async()=>{
   const s=setup(); await s.ctx.loadBoard();
   assert.equal(s.ctx.els.boardStamp.textContent,'1 epic, 2 tasks');
 });
+// ── finished work is hidden by default, and it is a view preference ────────
+function withHistory(s) {
+  s.board.epics.push({id:'EP-001', key:'EP-001', row:1, title:'Old epic', status:'done'});
+  s.board.tasks.push({id:'TM-001', key:'TM-001', row:1, epic:'EP-001', title:'Old', status:'done', assignee:'claude'},
+                     {id:'TM-040', key:'TM-040', row:805, epic:'EP-015', title:'Finished', status:'done', assignee:'claude'});
+  return s;
+}
+await test('done tasks and finished empty epics are hidden by default, and counted',async()=>{
+  const s=withHistory(setup()); await s.ctx.loadBoard();
+  const keys=nodes(s.root,'board-key').map(n=>n.textContent);
+  assert.ok(!keys.includes('TM-040') && !keys.includes('TM-001') && !keys.includes('EP-001'), keys.join());
+  assert.ok(keys.includes('TM-038'));
+  assert.equal(nodes(s.root,'epic').find(c=>c.dataset.epic==='EP-015').children[0].children
+               .find(n=>n.className==='epic-meta').textContent,'1/2','the count still covers finished work');
+  assert.equal(s.ctx.els.boardStamp.textContent,'2 epics, 4 tasks, 2 done hidden');
+});
+await test('with hide-done off, history is shown',async()=>{
+  const s=withHistory(setup({'ccc.boardHideDone':'0'})); await s.ctx.loadBoard();
+  const keys=nodes(s.root,'board-key').map(n=>n.textContent);
+  for (const key of ['EP-001','TM-001','TM-040']) assert.ok(keys.includes(key), key);
+  assert.equal(s.ctx.els.boardStamp.textContent,'2 epics, 4 tasks');
+});
+await test('a board with only finished work says so instead of rendering nothing',async()=>{
+  const s=setup(); s.board.epics=[{id:'EP-001', key:'EP-001', row:1, title:'Old', status:'done'}];
+  s.board.tasks=[{id:'TM-001', key:'TM-001', row:1, epic:'EP-001', title:'Old', status:'done'}];
+  await s.ctx.loadBoard();
+  assert.equal(nodes(s.root,'epic').length,0);
+  assert.match(nodes(s.root,'empty')[0].textContent,/hide done/);
+});
+await test('a finished task does not mark its epic live, nor tag its assignee',async()=>{
+  const s=withHistory(setup({'ccc.boardHideDone':'0'}));
+  s.ctx.liveAgents.set('claude',{name:'claude',cli:'claude'});
+  await s.ctx.loadBoard();
+  const old=nodes(s.root,'epic').find(c=>c.dataset.epic==='EP-001');
+  assert.ok(!old.classList.contains('has-live'),'an epic of finished work lit up for a live name');
+  assert.ok(!nodes(s.root).some(n=>n.dataset.agent==='claude'),'a finished task tagged its assignee as live');
+  s.board.tasks.push({id:'TM-041', key:'TM-041', row:806, epic:'EP-001', title:'Reopened', status:'in_progress', assignee:'claude'});
+  await s.ctx.loadBoard();
+  assert.ok(nodes(s.root,'epic').find(c=>c.dataset.epic==='EP-001').classList.contains('has-live'));
+});
+
+// ── the detail panel reads the card on demand, as text ──────────────────────
+await test('clicking a title shows criteria, evidence, comments and history',async()=>{
+  const s=setup(); s.ctx.els.taskDetail=new Node('aside'); await s.ctx.loadBoard();
+  const asked=[];
+  s.ctx.getJSON=async(path)=>{ asked.push(path);
+    if (path.startsWith('api/board/entity')) return {key:'TM-038', title:'Task', status:'done', epic:'EP-015',
+      body:'<b>not markup</b>', acceptance:[{text:'works', done:true},{text:'fast', done:false}],
+      evidence:['C:/ev/TM-038/run.log'], comments:[{author:'main', ts:'2026-09-23T18:41:26.697+00:00', text:'note'}]};
+    return {events:[{ts:'2026-09-23T18:39:12.602+00:00', event:'create', actor:'main'}]}; };
+  await nodes(s.root,'t-title')[0].events.click();
+  assert.deepEqual(asked,['api/board/entity?id=TM-038','api/board/history?id=TM-038&limit=100']);
+  const pane=s.ctx.els.taskDetail;
+  assert.equal(pane.hidden,false);
+  assert.equal(nodes(pane,'td-body')[0].textContent,'<b>not markup</b>');
+  assert.deepEqual(nodes(pane).filter(n=>n.className.startsWith('td-ac')).map(n=>n.textContent),['✓ works','○ fast']);
+  assert.equal(nodes(pane,'td-ref')[0].textContent,'C:/ev/TM-038/run.log');
+  assert.match(nodes(pane,'td-event')[0].textContent,/create · main/);
+  assert.deepEqual(nodes(pane,'td-h').map(n=>n.textContent),
+    ['Acceptance criteria (2)','Evidence (1)','Comments (1)','History (1)']);
+  nodes(pane,'cbtn td-close')[0].events.click();
+  assert.equal(pane.hidden,true);
+});
+await test('a failed detail read says so in the panel',async()=>{
+  const s=setup(); s.ctx.els.taskDetail=new Node('aside'); await s.ctx.loadBoard();
+  s.ctx.getJSON=async()=>{throw Error('offline');};
+  await nodes(s.root,'t-title')[0].events.click();
+  assert.equal(s.ctx.els.taskDetail.children[0].textContent,'TM-038 unavailable: offline');
+});
 console.log(`passed ${passed}, failed ${failed}`); process.exitCode=failed ? 1 : 0;
 })().catch(e=>{console.error(e); console.log(`passed ${passed}, failed ${failed+1}`); process.exitCode=1;});
 JS
