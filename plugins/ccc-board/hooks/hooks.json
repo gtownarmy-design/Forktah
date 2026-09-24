@@ -1,0 +1,19 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "python \"${CLAUDE_PLUGIN_ROOT}/hooks/ccc_hook.py\" session-start", "timeout": 10 } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "TaskCreate|TaskUpdate",
+        "hooks": [ { "type": "command", "command": "python \"${CLAUDE_PLUGIN_ROOT}/hooks/ccc_hook.py\" post-task", "timeout": 10 } ] },
+      { "matcher": "mcp__plugin_ccc-board_ccc-board__task_status",
+        "hooks": [ { "type": "command", "command": "python \"${CLAUDE_PLUGIN_ROOT}/hooks/ccc_hook.py\" post-status", "timeout": 10 } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "python \"${CLAUDE_PLUGIN_ROOT}/hooks/ccc_hook.py\" stop", "timeout": 10 } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "python \"${CLAUDE_PLUGIN_ROOT}/hooks/ccc_hook.py\" session-end", "timeout": 10 } ] }
+    ]
+  }
+}

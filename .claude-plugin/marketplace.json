@@ -8,6 +8,11 @@
   },
   "plugins": [
     {
+      "name": "ccc-board",
+      "description": "The Control Center board inside Claude Code: tickets, evidence, the journal and file claims, with hooks for the session summary, native-task mirroring, a Stop gate and park-on-exit.",
+      "source": "./plugins/ccc-board"
+    },
+    {
       "name": "voice-cli",
       "description": "See and steer Voice CLI, the local Whisper push-to-talk app in voice-cli/: lock it onto a terminal, switch mode or microphone, and hear the operator's next spoken phrase.",
       "source": "./plugins/voice-cli"

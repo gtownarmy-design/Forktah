@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "ccc-board",
+  "version": "1.0.0",
+  "description": "The Control Center board inside Claude Code: tickets, epics, acceptance criteria, evidence, the shared journal and file claims, over the dashboard's API. Hooks show the board at session start, mirror native tasks onto it, stop a turn from ending on an in-progress ticket with no evidence, and park a session's tickets when it ends.",
+  "author": {
+    "name": "gtownarmy-design",
+    "url": "https://github.com/gtownarmy-design"
+  },
+  "repository": "https://github.com/gtownarmy-design/Forktah",
+  "keywords": ["tasks", "kanban", "tickets", "agentmux", "control-center", "mcp"]
+}
