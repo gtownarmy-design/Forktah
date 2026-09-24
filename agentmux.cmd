@@ -22,12 +22,17 @@ shift
 goto loop
 
 :run
+REM The launcher is whatever install.sh wrote on the WSL user's own PATH, found by a
+REM login shell - not a path with one person's home directory in it. --exec hands the
+REM arguments to bash as argv, so no second shell re-splits or expands them.
+REM CCC_WSL_DISTRO picks the distribution (default Ubuntu).
+if not defined CCC_WSL_DISTRO set "CCC_WSL_DISTRO=Ubuntu"
 REM OUT holds embedded quotes, so test with "if defined" - a string compare
 REM against %OUT% would break batch parsing.
 if defined OUT goto withargs
-wsl.exe -d Ubuntu -- /home/nick/.local/bin/agentmux
+wsl.exe -d %CCC_WSL_DISTRO% --exec bash -lc "exec agentmux \"$@\"" agentmux
 goto done
 :withargs
-wsl.exe -d Ubuntu -- /home/nick/.local/bin/agentmux !OUT!
+wsl.exe -d %CCC_WSL_DISTRO% --exec bash -lc "exec agentmux \"$@\"" agentmux !OUT!
 :done
 endlocal

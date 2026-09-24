@@ -5,3 +5,8 @@
 # corrupt .pyc cannot be recompiled, because there is no source. Pin it explicitly.
 taskmgmt/recovered/*.bin binary
 *.pyc                    binary
+
+# Windows launchers are read by cmd.exe and wscript, which expect CRLF. Pinned so a
+# checkout made without core.autocrlf (a WSL clone, CI) still produces runnable files.
+*.cmd                    text eol=crlf
+*.vbs                    text eol=crlf
