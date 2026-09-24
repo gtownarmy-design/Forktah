@@ -221,6 +221,8 @@ run test_voice_mcp.py timeout 120 python3 dashboard/test_voice_mcp.py
 run test_import_bytedesk.py timeout 300 python3 dashboard/test_import_bytedesk.py
 # The ccc-board plugin against a real dashboard on a spare port.
 run test_ccc_mcp.py timeout 300 python3 dashboard/test_ccc_mcp.py
+# The Windows keepalive: dashboard restart, online backups and rotation, against fakes.
+run test_ccc_keepalive.sh bash /dev/fd/19 19< <(tr -d '' < dashboard/test_ccc_keepalive.sh)
 
 # test_gateway.py needs no key and makes no network call, so it runs whether or not the
 # Bedrock path is parked. Its last section compares the reconstructed
