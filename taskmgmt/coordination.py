@@ -309,6 +309,57 @@ def issue_warrant(agent, cli="?", hours=WARRANT_HOURS, issued_by="operator"):
     return secret
 
 
+MAX_RENEW_HOURS = 24
+
+
+def renew_warrant(hours=WARRANT_HOURS, renewed_by="operator"):
+    """Extend the live warrant from now, KEEPING its secret. Returns the new record.
+
+    WHY NOT RE-MINT. The warranted pane holds the secret in its environment, sourced
+    once at spawn. A fresh warrant has a fresh secret the running pane has never seen,
+    so re-minting strands the very orchestrator it was meant to rescue. Before this
+    existed, the only options were a restart (losing the orchestrator's context
+    mid-run) or hand-editing a 0600 file. That happened in run d2b2b4, where usage-limit
+    stalls outlasted the warrant (TM-144).
+
+    OPERATOR ONLY. Refused inside any pane, INCLUDING the warranted one. A dead-man's
+    switch the orchestrator could reset itself would not be one."""
+    if os.environ.get("AGENTMUX_AGENT"):
+        raise IdentityError(
+            f"identity: renewing the warrant is the operator's to do, and this is the "
+            f"{os.environ['AGENTMUX_AGENT']!r} pane. Run it outside any pane.")
+    try:
+        hours = float(hours)
+    except (TypeError, ValueError):
+        raise ValueError(f"hours must be a number, not {hours!r}") from None
+    if not 0 < hours <= MAX_RENEW_HOURS:
+        raise ValueError(f"hours must be above 0 and at most {MAX_RENEW_HOURS}")
+    try:
+        record = json.loads(WARRANT.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise ValueError("no warrant to renew: start the orchestrator instead") from None
+    except (OSError, ValueError):
+        raise ValueError(f"the warrant at {WARRANT} is unreadable: revoke it and start again") from None
+    if not isinstance(record, dict) or record.get("version") != 1 or not record.get("secret"):
+        raise ValueError(f"the warrant at {WARRANT} is not one this version wrote")
+    now_ts = time.time()
+    record.update(expires_at=int(now_ts + hours * 3600), renewed_at=int(now_ts),
+                  renewed_by=str(renewed_by)[:64], renewals=int(record.get("renewals") or 0) + 1)
+    handle, tmp = tempfile.mkstemp(dir=str(ROOT), prefix=".warrant-")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, indent=2) + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, WARRANT)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return {k: v for k, v in record.items() if k != "secret"}
+
+
 def revoke_warrant():
     """Remove the authority before anything else. Ordering is load-bearing: the warrant
     goes first, so a pane that survives the kill that follows is already powerless."""

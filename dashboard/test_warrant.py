@@ -149,6 +149,49 @@ class TestTheWarrantItself(WarrantBase):
         self.assertIsNone(self.co.orchestrator_warrant())
 
 
+class TestRenewal(WarrantBase):
+    """TM-144: a run that outlives its warrant must not strand the orchestrator."""
+
+    def operator(self):
+        # Renewal is done from OUTSIDE any pane; the pane's own env is put back after.
+        pane = os.environ.pop("AGENTMUX_AGENT", None)
+        self.addCleanup(lambda: os.environ.__setitem__("AGENTMUX_AGENT", pane) if pane else None)
+
+    def test_renewing_an_expired_warrant_reauthorises_the_same_pane(self):
+        secret = self.issue()
+        self.tamper(expires_at=int(time.time()) - 1)
+        self.assertIsNone(self.co.orchestrator_warrant(), "the paired negative: it had expired")
+        self.operator()
+        record = self.co.renew_warrant(hours=2, renewed_by="test")
+        os.environ["AGENTMUX_AGENT"] = AGENT
+        self.assertEqual(os.environ["AGENTMUX_ORCHESTRATOR_WARRANT"], secret)
+        self.assertEqual(self.co.orchestrator_warrant(), AGENT, "the pane's old secret works again")
+        self.assertNotIn("secret", record)
+        self.assertEqual((record["renewals"], record["renewed_by"]), (1, "test"))
+        self.assertAlmostEqual(record["expires_at"], time.time() + 7200, delta=5)
+        self.assertEqual(oct(self.co.WARRANT.stat().st_mode & 0o777), "0o600")
+
+    def test_the_warranted_pane_cannot_renew_itself(self):
+        self.issue()
+        with self.assertRaisesRegex(self.co.IdentityError, "operator's to do"):
+            self.co.renew_warrant()
+
+    def test_no_other_pane_can_renew_it_either(self):
+        self.issue()
+        os.environ["AGENTMUX_AGENT"] = "psy-analyst"
+        with self.assertRaises(self.co.IdentityError):
+            self.co.renew_warrant()
+
+    def test_there_must_be_a_warrant_and_a_sane_duration(self):
+        with self.assertRaisesRegex(ValueError, "no warrant to renew"):
+            self.co.renew_warrant()
+        self.issue()
+        self.operator()
+        for bad in (0, -1, self.co.MAX_RENEW_HOURS + 1, "soon"):
+            with self.assertRaises(ValueError, msg=bad):
+                self.co.renew_warrant(hours=bad)
+
+
 class TestTheReservedName(WarrantBase):
     """LOAD-BEARING. resolve_identity routes who == "orchestrator" straight into
     orchestrator_identity with allow_test_identity=False. A warrant naming it would let
