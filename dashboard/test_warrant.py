@@ -27,6 +27,12 @@ import time
 import unittest
 from pathlib import Path
 
+# Hermetic: the journal goes to a dead port (so it falls back to the throwaway home's
+# file) and desktop toasts are off. Outside the gate these suites wrote their test runs
+# into the LIVE journal and could pop real notifications (TM-134).
+os.environ["AGENTMUX_DASHBOARD"] = "http://127.0.0.1:9"
+os.environ["AGENTMUX_NO_TOAST"] = "1"
+
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 sys.path.insert(0, str(REPO / "taskmgmt"))

@@ -901,7 +901,20 @@ except Exception:
 # modal_text takes the text, modal_prompt supplies it from a pane.
 # dashboard/test_modal_guard.sh exercises modal_text against captured samples.
 modal_text() {
-  printf '%s' "$1" | grep -Eqi \
+  # An IDLE INPUT LINE - the prompt marker alone, bare (claude's `❯` between rules) or
+  # inside a box border (grok's `│ ❯ │`) - means the CLI is at its normal input, and
+  # everything above it is conversation. Agent prose is not a dialog: an orchestrator
+  # that ended its answer with "Which do you want?" and a numbered list matched
+  # `do you want` and `❯ 1.`-style menus, and every send and courier delivery to it was
+  # refused (TM-133). So only what sits BELOW the last idle input line is examined. A
+  # real modal replaces the input box, so it never has one above it; and its own menu
+  # line always carries text after the marker ("❯ No, exit"), so it is never idle.
+  # Claude pads its idle marker with a NO-BREAK SPACE (U+00A0, \302\240), which
+  # [[:space:]] does not match - so it is spelled out.
+  printf '%s\n' "$1" | awk '
+    /^([[:space:]]|\302\240)*(│|\|)?([[:space:]]|\302\240)*(❯|›|>)([[:space:]]|\302\240)*(│|\|)?([[:space:]]|\302\240)*$/ { below = ""; next }
+    { below = below $0 "\n" }
+    END { printf "%s", below }' | grep -Eqi \
     'press enter to continue|update now \(runs|\[y/n\]|\(y/n\)|do you (want|trust)|allow this|press any key|select an option|continue\? *$|enter to confirm|esc to cancel|no, (exit|quit)|yes, i (accept|trust)|trust this folder|[❯›▶>][[:space:]]+([0-9]+\.|yes\b|no\b|switch\b|keep\b|continue\b|sign in\b|log ?in\b)'
 }
 
@@ -1338,15 +1351,21 @@ run_py() {
 cmd_run() {
   local action="${1:-status}"; shift || true
   local me="${AGENTMUX_AGENT:-orchestrator}"
+  # start and complete take NO --by. run.py resolves them through
+  # orchestrator_identity, which attributes them to the orchestrator and refuses any
+  # other --by. Passing $AGENTMUX_AGENT made a WARRANTED orchestrator pane
+  # (--by psy-orchestrator) unable to open or complete any run from the wrapper; the
+  # warrant suites called run.py directly, so they never saw it (TM-133).
   case "$action" in
-    start)    python3 "$(run_py)" start "${1:?a one-line description of the request}" --by "$me" ;;
+    start)    python3 "$(run_py)" start "${1:?a one-line description of the request}" ;;
     assign)   python3 "$(run_py)" assign "$@" ;;
     submit)   python3 "$(run_py)" submit "${1:-${AGENTMUX_JOB:-}}" --by "$me" "${@:2}" ;;
     verdict)  python3 "$(run_py)" verdict "$@" --by "$me" ;;
     status)   python3 "$(run_py)" status "$@" ;;
-    complete) python3 "$(run_py)" complete "$@" --by "$me" ;;
+    complete) python3 "$(run_py)" complete "$@" ;;
+    amend)    python3 "$(run_py)" amend "$@" ;;
     teardown) cmd_run_teardown "$@" ;;
-    *) die "run: start|assign|submit|verdict|status|complete|teardown" ;;
+    *) die "run: start|assign|submit|verdict|status|complete|amend|teardown" ;;
   esac
 }
 

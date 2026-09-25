@@ -55,6 +55,37 @@ modal 'claude bypass consent (2026-09-22)' '  By proceeding, you accept all resp
     Yes, I accept
   Enter to confirm · Esc to cancel'
 
+echo '--- an agent at its input, whose last ANSWER reads like a dialog (TM-133) ---'
+# Captured from psy-orchestrator on 2026-09-24: it escalated with a question and a
+# numbered list, then sat at an empty prompt, and send refused it as "showing a prompt".
+normal 'claude idle, prose ends "Which do you want?"' '  3. Open the run yourself and give me the run id.
+  Which do you want? Once the run is open, TM-117 goes to psy-scout.
+✻ Brewed for 59s · done 10:52 PM
+────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent'
+normal 'claude idle, a numbered menu in the answer' '  Do you want me to:
+  ❯ 1. Fix the wrapper
+    2. Work around it
+────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)'
+normal 'grok idle in its box, prose asks "do you trust"' '     Do you trust the numbers in notes/lsd.md? I checked 3 of 5.
+  Help improve Grok                                     [Opt out] [Opt in]
+  ╭──────────────────────────────────────────────────────────────╮
+  │ ❯                                                            │
+  ╰──────────────────────────────── Grok 4.7 (high) · always-approve ─╯
+  Shift+Tab:mode  │  Ctrl+x:shortcuts'
+# ...and the same frame does not hide a dialog that REPLACES the input box.
+modal 'claude permission menu under old input'  '────────────────────────────────
+❯
+────────────────────────────────
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No'
+
 echo '--- claude startup dialogs ---'
 modal 'folder trust'            '  Do you trust the files in this folder?
   ❯ No, exit

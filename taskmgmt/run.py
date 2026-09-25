@@ -182,6 +182,7 @@ def fold(events):
     jobs = {}
     request = None
     base = None
+    repo = None
     origin = None
     pane = None
     forced = False
@@ -190,8 +191,14 @@ def fold(events):
         if kind == "start":
             request = event.get("detail")
             base = event.get("base") or base
+            repo = event.get("repo") or repo
             origin = event.get("origin") or origin
             pane = event.get("pane") or pane
+            continue
+        if kind == "amend":
+            # The operator's correction of where a run's files live. See cmd_amend.
+            repo = event.get("repo") or repo
+            base = event.get("base") or base
             continue
         if kind == "forced":
             forced = True
@@ -225,8 +232,32 @@ def fold(events):
         elif kind == "escalate":
             row["state"] = "escalated"
             row["detail"] = event.get("detail")
-    return {"request": request, "base": base, "origin": origin, "pane": pane,
+    return {"request": request, "base": base, "repo": repo, "origin": origin, "pane": pane,
             "jobs": jobs, "forced": forced}
+
+
+def project_repo(start=None):
+    """The git checkout a run's work lives in: the toplevel of `start` (default: cwd).
+
+    WHY A RUN RECORDS IT. Submitted paths are relative, and every consumer of them -
+    the submit digest, the approval pin, the Runs view's diff - resolved them against
+    THIS checkout. For a project elsewhere (a research repo whose orchestrator runs in
+    that repo) every hash came out "missing" and the operator's review diff showed this
+    checkout's changes instead of the run's work: approval of the wrong bytes, which is
+    the one thing that gate exists to prevent (TM-135). None outside any repo."""
+    try:
+        proc = subprocess.run(["git", "-C", str(start or Path.cwd()), "rev-parse",
+                               "--show-toplevel"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    top = (proc.stdout or "").strip()
+    return Path(top) if proc.returncode == 0 and top else None
+
+
+def recorded_repo(run_id):
+    """The project checkout recorded for this run, or None for a run of this checkout."""
+    value = fold(load_events(run_id)).get("repo")
+    return Path(value) if value else None
 
 
 def repo_head(repo=None):
@@ -328,7 +359,8 @@ def write_approval(run_id, by, note, decision="approved", repo=None):
                 "Approval is the gate after review, not instead of it.")
     record = {"version": APPROVAL_VERSION, "run": run_id, "decision": decision,
               "by": by, "at": now(), "note": (note or "")[:NOTE_MAX],
-              "files": digest(str(repo or REPO_ROOT), submitted_files(state))}
+              "files": digest(str(repo or state.get("repo") or REPO_ROOT),
+                              submitted_files(state))}
     handle, tmp = tempfile.mkstemp(dir=str(directory), prefix=".approval-")
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as fh:
@@ -353,7 +385,7 @@ def approval_drift(run_id, repo=None):
     if not record or record.get("decision") != "approved":
         return None
     pinned = record.get("files") or {}
-    current = digest(str(repo or REPO_ROOT), sorted(pinned))
+    current = digest(str(repo or recorded_repo(run_id) or REPO_ROOT), sorted(pinned))
     return tuple(sorted(name for name, was in pinned.items()
                         if current.get(name) != was))
 
@@ -770,21 +802,68 @@ def cmd_start(args):
             continue
         os.chmod(directory, 0o700)
         (directory / "request.md").write_text(args.request, encoding="utf-8")
+        # THE PROJECT, recorded only when it is not this checkout, so every run of this
+        # checkout reads exactly as before and a suite pointing runsview.REPO at a
+        # scratch tree keeps working. See project_repo.
+        project = Path(args.repo).resolve() if args.repo else project_repo()
+        if project is not None and project.resolve() == REPO_ROOT.resolve():
+            project = None
         # WHERE THIS WAS ASKED FOR, so a notice can go back to it. The toast reaches
         # whoever is at this machine's desktop; it does not reach the session holding
         # the context that knows what the run was for. That session is the one that has
         # to look when the run stops at the operator gate.
-        append_event(run_id, {"event": "start", "by": by,
-                              "base": repo_head(REPO_ROOT),
-                              "via": coordination.orchestrator_pane(),
-                              "origin": notify.origin_id(),
-                              "pane": os.environ.get("TMUX_PANE") or None,
-                              "detail": args.request[:DETAIL_MAX]})
+        event = {"event": "start", "by": by,
+                 "base": repo_head(project or REPO_ROOT),
+                 "via": coordination.orchestrator_pane(),
+                 "origin": notify.origin_id(),
+                 "pane": os.environ.get("TMUX_PANE") or None,
+                 "detail": args.request[:DETAIL_MAX]}
+        if project is not None:
+            event["repo"] = str(project)
+        append_event(run_id, event)
         coordination.journal("plan", f"run {run_id} started", args.request[:2000], by)
         print(run_id)
         return 0
     print("run: could not allocate a run id", file=sys.stderr)
     return 1
+
+
+def cmd_amend(args):
+    """Correct where a run's files live, for a run opened before `start` recorded it.
+
+    A PERSON'S CORRECTION, so it is refused from every pane, warranted or not: the
+    warrant buys four verbs and this is not one of them. And refused once anything has
+    been submitted, because those submissions were hashed against the old checkout and
+    moving the run underneath them would make the pins describe different files."""
+    if (os.environ.get("AGENTMUX_AGENT")
+            and os.environ.get("AGENTMUX_TRUST_IDENTITY") != "1"):
+        print(f"run: amend is the operator's to call, and this is the "
+              f"{os.environ['AGENTMUX_AGENT']!r} pane", file=sys.stderr)
+        return 2
+    if not valid_run(args.run) or not run_dir(args.run).is_dir():
+        print(f"run: no such run {args.run!r}", file=sys.stderr)
+        return 2
+    if complete_path(args.run).exists():
+        print(f"run: {args.run} is already complete", file=sys.stderr)
+        return 2
+    state = fold(load_events(args.run))
+    moved = sorted(j for j, r in state["jobs"].items() if r["state"] not in ("assigned", "working"))
+    if moved:
+        print(f"run: {', '.join(moved)} already submitted against the old checkout; "
+              f"amending now would orphan those hashes", file=sys.stderr)
+        return 2
+    repo = Path(args.repo).resolve()
+    top = project_repo(repo)
+    if top is None or top.resolve() != repo:
+        print(f"run: {repo} is not the top of a git checkout", file=sys.stderr)
+        return 2
+    base = repo_head(repo)
+    append_event(args.run, {"event": "amend", "by": "orchestrator", "repo": str(repo),
+                            "base": base, "detail": (args.reason or "")[:DETAIL_MAX]})
+    coordination.journal("note", f"run {args.run} amended: files live in {repo}",
+                         args.reason or "", "orchestrator")
+    print(f"run {args.run}: repo {repo}, base {base}")
+    return 0
 
 
 def cmd_assign(args):
@@ -857,7 +936,9 @@ def cmd_submit(args):
         return 2
 
     files = [f for f in (args.files or "").split(",") if f.strip()]
-    hashes = digest(args.repo, files)
+    # The run's own project first: AGENTMUX_REPO is this checkout in every pane, which
+    # hashed a research repo's files as "missing" (TM-135).
+    hashes = digest(args.repo or state.get("repo") or os.environ.get("AGENTMUX_REPO"), files)
     directory = job_dir(run_id, index)
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "submission.md").write_text(
@@ -1212,7 +1293,16 @@ def main(argv=None):
     start = sub.add_parser("start")
     start.add_argument("request")
     start.add_argument("--by", default=None)
+    start.add_argument("--repo", default=None,
+                       help="the checkout the run's files live in (default: the git "
+                            "toplevel of the current directory)")
     start.set_defaults(func=cmd_start)
+
+    amend = sub.add_parser("amend")
+    amend.add_argument("run")
+    amend.add_argument("--repo", required=True)
+    amend.add_argument("--reason", default="")
+    amend.set_defaults(func=cmd_amend)
 
     assign = sub.add_parser("assign")
     assign.add_argument("run")
@@ -1227,7 +1317,8 @@ def main(argv=None):
     submit.add_argument("--by", default=os.environ.get("AGENTMUX_AGENT"))
     submit.add_argument("--files", default="")
     submit.add_argument("--summary", default="")
-    submit.add_argument("--repo", default=os.environ.get("AGENTMUX_REPO"))
+    submit.add_argument("--repo", default=None,
+                        help="default: the run's recorded project, else $AGENTMUX_REPO")
     submit.set_defaults(func=cmd_submit)
 
     verdict = sub.add_parser("verdict")

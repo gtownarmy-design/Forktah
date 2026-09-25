@@ -219,6 +219,8 @@ run test_warrant.py python3 dashboard/test_warrant.py
 # Team files (agentmux teamfile): validation, the up plan, and the spawn flags that
 # `orchestrator start` shares with it.
 run test_teamfile.py python3 dashboard/test_teamfile.py
+# A run whose files live in another checkout: submit hashes, review diff, approval pin.
+run test_run_project.py python3 dashboard/test_run_project.py
 # EP-015 suites are registered at the scaffold seam before their owning tasks land.
 # Missing suites are explicit skips during the staged build; present suites use
 # the same failure accounting as every existing suite above.
