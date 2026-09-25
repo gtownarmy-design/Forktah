@@ -267,6 +267,41 @@ class TestItBuysExactlyFourVerbs(WarrantBase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("COMPLETE", done.stdout)
 
+    def wrapper(self, *args, env=None):
+        # THROUGH agentmux.sh, not run.py. Every other test here calls run.py directly,
+        # which is exactly how the wrapper passing --by "$AGENTMUX_AGENT" to start and
+        # complete went unseen until a real warranted pane hit it (TM-132).
+        environ = dict(os.environ, AGENTMUX_REPO=str(REPO))
+        environ.update(env or {})
+        return subprocess.run(
+            ["bash", "-c", 'bash <(tr -d "\\r" < "$1") "${@:2}"', "_",
+             str(REPO / "agentmux.sh"), *args],
+            capture_output=True, text=True, env=environ, cwd=str(REPO), timeout=60)
+
+    def test_the_wrapper_lets_a_warranted_pane_start_and_reach_the_gate(self):
+        secret = self.issue()
+        env = {"AGENTMUX_AGENT": AGENT, "AGENTMUX_ORCHESTRATOR_WARRANT": secret}
+        start = self.wrapper("run", "start", "through the wrapper", env=env)
+        self.assertEqual(start.returncode, 0, start.stderr)
+        self.assertNotIn("--by", start.stderr)
+        rid = start.stdout.strip().splitlines()[-1]
+        assign = self.run_cli("assign", rid, "--worker", "w-a", "--reviewer", "r-a", env=env)
+        job = assign.stdout.strip()
+        trust = dict(env, AGENTMUX_TRUST_IDENTITY="1")
+        self.run_cli("submit", job, "--by", "w-a", "--summary", "done",
+                     env=dict(trust, AGENTMUX_AGENT="w-a"))
+        self.run_cli("verdict", job, "--by", "r-a", "--pass", "--reason", "ok",
+                     env=dict(trust, AGENTMUX_AGENT="r-a"))
+        # Refused by the OPERATOR gate - not by the --by check that used to fire first.
+        done = self.wrapper("run", "complete", rid, env=env)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertNotIn("cannot be honoured", done.stderr)
+        self.assertIn("approv", (done.stdout + done.stderr).lower())
+        self.run.write_approval(rid, "operator (dashboard)", "read it", "approved")
+        done = self.wrapper("run", "complete", rid, env=env)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("COMPLETE", done.stdout)
+
     def test_the_ledger_records_that_it_was_not_a_person(self):
         # Without this the log cannot tell an autonomous run from an operator-driven
         # one at all, which is the first question asked after a surprise.
