@@ -102,3 +102,19 @@ Where Forktah differs from upstream on purpose:
 - `run_tests.sh` also registers the Forktah suites (roll call, voice MCP, bytedesk import,
   ccc-board MCP, keepalive) next to upstream's new runsview, notify, runcards and warrant
   suites.
+
+## Standing teams and the first research run (EP-036)
+
+`agentmux teamfile` brings a team up from one YAML file (`docs/TEAMFILE.md`). The first team
+to use it, a research team of 2 Claude and 2 Grok agents on EP-035, found and fixed these:
+
+| Ticket | What |
+|---|---|
+| TM-127 | ccc-board `task_link` claimed it could add a blocker, but it wrote an ignored link; `blocked-by` is now a real dependency |
+| TM-128 | `orchestrator start` dropped the definition's persona, posture and model |
+| TM-129 | `orchestrator start --cwd DIR` gives a project outside this checkout its own orchestrator |
+| TM-131 | `AGENTMUX_IDLE_MINUTES=0` at spawn now sticks to the agent (`run/<name>.noidle`) |
+| TM-132 | `run start`/`complete` from a warranted pane were refused (the wrapper passed `--by`) |
+| TM-133 | `send` refused a pane at normal input when the agent's answer said "do you want" |
+| TM-134 | three run suites wrote to the live journal outside the gate |
+| TM-135 | runs of an outside project hashed, diffed and pinned the wrong repo; `run amend` added |

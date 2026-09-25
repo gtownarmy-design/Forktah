@@ -187,6 +187,28 @@ class Tests(unittest.TestCase):
         self.assertEqual(summary["activeEpic"], self.epic)
         self.assertFalse(self.client.call("task_history", {"id": key})[0])
 
+    def test_blocked_by_is_a_real_dependency_and_can_be_cleared(self):
+        # TM-127: 'add a blocker' used to write an informational link the queue ignores.
+        first, second = self.new_task("Upstream work"), self.new_task("Downstream work")
+        is_error, task = self.client.call("task_link", {"id": second, "type": "blocked-by",
+                                                        "target": first})
+        self.assertFalse(is_error, task)
+        self.assertEqual(self.show(second)["blockedBy"], [first])
+        self.assertEqual(self.show(second)["links"], [])        # a dep, not a link
+        is_error, task = self.client.call("task_link", {"id": second, "type": "blocker",
+                                                        "target": first, "present": False})
+        self.assertFalse(is_error, task)
+        self.assertEqual(self.show(second)["blockedBy"], [])
+        # An informational link still lands in links, and still holds nothing back.
+        self.assertFalse(self.client.call("task_link", {"id": second, "type": "relates",
+                                                        "target": first})[0])
+        shown = self.show(second)
+        self.assertEqual(shown["links"], [{"type": "relates", "id": first}])
+        self.assertEqual(shown["blockedBy"], [])
+        self.assertFalse(self.client.call("task_link", {"id": second, "type": "relates",
+                                                        "target": first, "present": False})[0])
+        self.assertEqual(self.show(second)["links"], [])
+
     def test_journal_round_trip(self):
         self.assertFalse(self.client.call("journal_write", {"kind": "claim", "subject": "TM-999 testing the journal"})[0])
         is_error, read = self.client.call("journal_read", {"limit": 5})

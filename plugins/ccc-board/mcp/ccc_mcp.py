@@ -63,6 +63,21 @@ def evidence(args):
     return {"ref": ref, "evidence": result.get("evidence")}
 
 
+# A queue dependency and an informational link are different tables on the board:
+# board_deps (what `next`, dispatch and readiness consult) and board_links (which they
+# ignore). The tool used to describe itself as able to "add a blocker" while only ever
+# writing a link, so a card an agent "blocked" was still offered by the queue (TM-127).
+DEP_TYPES = ("blocked-by", "blocker")
+
+
+def link(args):
+    present = args.get("present", True)
+    if args["type"] in DEP_TYPES:
+        return cc.write("dep", id=args["id"], blockedBy=args["target"], present=present)
+    return cc.write("link", id=args["id"], type=args["type"], target=args["target"],
+                    present=present)
+
+
 def agentmux_tool(*argv):
     rc, out, err = cc.agentmux(*argv)
     if rc != 0:
@@ -109,9 +124,13 @@ TOOLS = [
     ("task_assign", "Set who a ticket is assigned to.",
      obj({"id": KEY, "assignee": TEXT}, ["id", "assignee"]),
      lambda a: cc.write("update", id=a["id"], patch={"assignee": a["assignee"]})),
-    ("task_link", "Link two tickets (relates, blocks, duplicates, ...) or add a blocker.",
-     obj({"id": KEY, "type": TEXT, "target": KEY}, ["id", "type", "target"]),
-     lambda a: cc.write("link", id=a["id"], type=a["type"], target=a["target"], present=True)),
+    ("task_link", "Relate two tickets. type 'blocked-by' (alias 'blocker') is a real queue "
+     "dependency: `id` waits for `target` and is not offered as next work until `target` is done. "
+     "The other types - relates, duplicates, blocks, causes, implements - are informational links "
+     "and hold nothing back. present=false removes either kind.",
+     obj({"id": KEY, "type": TEXT, "target": KEY, "present": {"type": "boolean"}},
+         ["id", "type", "target"]),
+     link),
     ("epic_create", "Open an epic. New tickets go under the active epic.",
      obj({"title": TEXT, "body": TEXT}, ["title"]), lambda a: cc.write("create", kind="epic", **a)),
     ("epic_use", "Make an epic the active one.",
