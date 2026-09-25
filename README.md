@@ -138,6 +138,14 @@ agentmux orchestrator stop        # revokes FIRST, then kills the pane
 
 Stop revokes before it kills, so a pane that survives the kill is already powerless.
 
+For a project outside this checkout, give the orchestrator that project:
+`agentmux orchestrator start --agent <name> --cwd /path/to/project --request "..."`. Its
+definition is read from `/path/to/project/.agentmux/agents/`, then the global scope,
+together with its persona, posture and model. The pane starts in that folder, and the
+run's diffs and approvals use that repo. To bring up a whole standing team (courier,
+members with personas, orchestrator, kickoffs) from one YAML file, use
+`agentmux teamfile up team.yaml` - see [docs/TEAMFILE.md](docs/TEAMFILE.md).
+
 ### When it gets stuck
 
 Three failed reviews escalate automatically. The card is parked, claims released, and
