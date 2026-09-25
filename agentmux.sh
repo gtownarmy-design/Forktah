@@ -312,6 +312,15 @@ agentmux - drive other agent CLIs in tmux panes
                                THE GATE. Refuses until every job is verified. --force
                                records what was unfinished before anything is torn down
   run    teardown <run>        close only THIS run's agents; courier stays up
+  orchestrator start --request "<what>" [--agent NAME] [--cwd DIR] [--hours H]
+  orchestrator stop|status     one warranted orchestrator pane at a time. Its
+                               definition (cli, posture, model, persona) is read from
+                               DIR/.agentmux/agents (default: this checkout), then the
+                               global scope; it starts in DIR
+  teamfile validate|up|status|down|kickoff <team.yaml> [--dry-run]
+                               bring a whole team up or down from one YAML file:
+                               courier, orchestrator, members with their personas, and
+                               a kickoff message to each. Format: docs/TEAMFILE.md
   claim  <resource> [--ttl S] [--note T] [--task ID] [--depends-on R]
                                TAKE A WORK LOCK before editing anything another agent
                                could touch. Atomic: exactly one agent wins. Refused
@@ -768,6 +777,17 @@ except Exception:
     tm kill-session -t "=$name" 2>/dev/null
     rm -f "$RUNDIR/$name".*
     die "could not record spawn metadata"
+  fi
+  # AGENTMUX_IDLE_MINUTES=0 at spawn time is a decision about THIS agent, and it has
+  # to outlive the environment it was made in. The watchdog is one process for every
+  # agent, started by whichever spawn came first or next, with that spawn's limit. So
+  # a reviewer spawned with the timeout off, waiting an hour for its first draft, was
+  # still closed by a watchdog someone else's spawn started. The marker makes the
+  # exemption per agent; idle_candidates skips it. Swept with the other sidecars.
+  if [ "${AGENTMUX_IDLE_MINUTES:-$IDLE_MINUTES}" = 0 ]; then
+    : > "$RUNDIR/$name.noidle"
+  else
+    rm -f "$RUNDIR/$name.noidle"
   fi
   # Read back by `list` and by the dashboard through its hardened read_field().
   [ -n "$task" ] && printf '%s\n' "$task" > "$RUNDIR/$name.task"
@@ -1943,6 +1963,8 @@ idle_candidates() {
     activity="${line%% *}"; attached="${line##* }"
     case "$activity$attached" in *[!0-9]*) continue ;; esac
     [ "$attached" != "0" ] && continue
+    # Spawned with AGENTMUX_IDLE_MINUTES=0: exempt, whatever limit this watchdog has.
+    [ -e "$RUNDIR/$name.noidle" ] && continue
     idle=$(( now - activity ))
     [ "$idle" -ge "$limit_s" ] && printf '%s %s\n' "$name" "$idle"
   done
@@ -2229,16 +2251,23 @@ print(f"{left//60}m" if left>0 else "EXPIRED")' "$ROOT/orchestrator.warrant" 2>/
 }
 
 orchestrator_start() {
-  local name="$ORCH_DEFAULT_AGENT" request="" hours=8
+  local name="$ORCH_DEFAULT_AGENT" request="" hours=8 cwd=""
+  local repo="${AGENTMUX_REPO:-$PWD}"
   while [ $# -gt 0 ]; do
     case "$1" in
       --agent)   name="${2:-}"; shift 2 ;;
       --request) request="${2:-}"; shift 2 ;;
       --hours)   hours="${2:-8}"; shift 2 ;;
+      --cwd)     cwd="$(to_wsl_path "${2:-}")"; shift 2 ;;
       *) printf 'orchestrator start: unknown option %s\n' "$1" >&2; return 2 ;;
     esac
   done
   [ -n "$request" ] || { printf 'orchestrator start: --request is required - say what it should do\n' >&2; return 2; }
+  # --cwd is where the orchestrator works AND where its definition is looked up first
+  # (DIR/.agentmux/agents, then the global scope), so a project outside this checkout
+  # can keep its own orchestrator. Without it, both are this checkout, as before.
+  [ -n "$cwd" ] || cwd="$repo"
+  [ -d "$cwd" ] || { printf 'orchestrator start: --cwd %s is not a directory\n' "$cwd" >&2; return 2; }
 
   # ONE AT A TIME. Checked against tmux, not against a file, because a stale file is
   # exactly how you end up with two.
@@ -2248,53 +2277,59 @@ orchestrator_start() {
     return 1
   fi
 
+  # THE DEFINITION ON DISK DECIDES HOW THE PANE STARTS, never this function.
+  #
+  # The first version hardcoded `claude`, which is not on PATH inside WSL on every box.
+  # The second read only the CLI from the definition and dropped the rest - persona,
+  # posture, model - so the orchestrator started with none of the rules its persona
+  # exists to carry (TM-128: no AGENTMUX_PERSONA_FILE in the pane, empty .agentdef).
+  # teamfile.py spawn-args builds the same flags the dashboard's hire and every team
+  # launcher use, and writes the persona to a file cmd_spawn copies before we delete it.
+  # Resolved BEFORE the warrant is minted: no warrant for a definition that is not there.
+  local persona_tmp; persona_tmp="$(mktemp)" || return 1
+  local -a defargs=()
+  local argsfile; argsfile="$(mktemp)" || { rm -f "$persona_tmp"; return 1; }
+  if ! python3 "$repo/taskmgmt/teamfile.py" spawn-args "$name" --project "$cwd" \
+        --role lead --persona-out "$persona_tmp" > "$argsfile"; then
+    printf 'orchestrator: no usable definition for %s in %s/.agentmux/agents/ or the global scope\n' \
+      "$name" "$cwd" >&2
+    rm -f "$persona_tmp" "$argsfile"
+    return 1
+  fi
+  mapfile -d '' -t defargs < "$argsfile"
+  rm -f "$argsfile"
+  local cli="" i
+  for ((i = 0; i < ${#defargs[@]}; i++)); do
+    [ "${defargs[$i]}" = --cli ] && cli="${defargs[$((i + 1))]}"
+  done
+
   printf 'minting a warrant for %s (%sh)...\n' "$name" "$hours"
   AGENTMUX_HOME="$ROOT" python3 -c 'import sys
 sys.path.insert(0, sys.argv[1])
 import coordination
 coordination.issue_warrant(sys.argv[2], cli=sys.argv[3], hours=float(sys.argv[4]),
                            issued_by="agentmux orchestrator start")' \
-    "${AGENTMUX_REPO:-$PWD}/taskmgmt" "$name" "shell" "$hours" || {
-      printf 'orchestrator: could not mint a warrant\n' >&2; return 1; }
+    "$repo/taskmgmt" "$name" "${cli:-?}" "$hours" || {
+      printf 'orchestrator: could not mint a warrant\n' >&2; rm -f "$persona_tmp"; return 1; }
+  printf 'spawning %s (%s) in %s...\n' "$name" "$cli" "$cwd"
 
-  # THE CLI COMES FROM THE DEFINITION ON DISK, never from here.
-  #
-  # Hardcoding it was the first version and it was wrong twice over: it named `claude`,
-  # which is a Windows binary and is not on PATH inside WSL where the pane actually
-  # runs, so the spawn would have failed on this machine; and it duplicated a fact that
-  # .agentmux/agents/<name>.md already owns, which is exactly the "only id and name are
-  # read from the wire" bound that keeps the definition authoritative.
-  local cli
-  cli="$(AGENTMUX_REPO="${AGENTMUX_REPO:-$PWD}" python3 -c '
-import sys
-sys.path.insert(0, sys.argv[1] + "/taskmgmt")
-import agentdefs
-spec = agentdefs.resolve(sys.argv[2], sys.argv[1])
-print(getattr(spec, "cli", None) or (spec or {}).get("cli", "") if spec else "")
-' "${AGENTMUX_REPO:-$PWD}" "$name" 2>/dev/null)"
-  if [ -z "$cli" ]; then
-    printf 'orchestrator: no definition for %s in .agentmux/agents/ - revoking
-' "$name" >&2
-    AGENTMUX_HOME="$ROOT" python3 -c 'import sys
-sys.path.insert(0, sys.argv[1]); import coordination; coordination.revoke_warrant()'       "${AGENTMUX_REPO:-$PWD}/taskmgmt" 2>/dev/null
-    return 1
-  fi
-  printf 'spawning %s (%s)...
-' "$name" "$cli"
-
-  # Spawned as --role lead on purpose. dispatch.WORKER_RE is card-scoped and this name
-  # does not match it, so collect/pool ignore the orchestrator for free - no new role
-  # vocabulary to add in five files.
-  if ! cmd_spawn "$name" --cli "$cli" --cwd "${AGENTMUX_REPO:-$PWD}" --role lead; then
+  # Spawned as --role lead on purpose (spawn-args was asked for it). dispatch.WORKER_RE
+  # is card-scoped and this name does not match it, so collect/pool ignore the
+  # orchestrator for free - no new role vocabulary to add in five files.
+  if ! cmd_spawn "$name" --cwd "$cwd" "${defargs[@]}"; then
     printf 'orchestrator: spawn failed - revoking the warrant\n' >&2
+    rm -f "$persona_tmp"
     AGENTMUX_HOME="$ROOT" python3 -c 'import sys
 sys.path.insert(0, sys.argv[1]); import coordination; coordination.revoke_warrant()' \
-      "${AGENTMUX_REPO:-$PWD}/taskmgmt" 2>/dev/null
+      "$repo/taskmgmt" 2>/dev/null
     return 1
   fi
+  rm -f "$persona_tmp"
 
   printf '%s\n' "$request" > "$ROOT/run/$name.request" 2>/dev/null || true
-  printf '\norchestrator %s is up. Brief it with:\n  agentmux send %s "<your request>"\n' "$name" "$name"
+  # The persona reaches the pane only as $AGENTMUX_PERSONA_FILE; nothing reads it for
+  # the agent, so the first message has to say so.
+  printf '\norchestrator %s is up. Brief it with:\n  agentmux send %s "Read \$AGENTMUX_PERSONA_FILE and follow it. <your request>"\n' "$name" "$name"
   printf 'Watch it: the Runs view in the CCC, or\n  agentmux attach %s\n' "$name"
 }
 
@@ -2317,6 +2352,9 @@ print(" ".join(coordination.revoke_warrant()) or "nothing to revoke")' \
 case "${1:-}" in
   spawn)  shift; cmd_spawn  "$@" ;;
   orchestrator) shift; cmd_orchestrator "$@" ;;
+  teamfile) shift
+          [ -n "${AGENTMUX_REPO:-}" ] || die "AGENTMUX_REPO is unset; cannot find taskmgmt/teamfile.py"
+          exec python3 "$AGENTMUX_REPO/taskmgmt/teamfile.py" "$@" ;;
   send)   shift; cmd_send   "$@" ;;
   key)    shift; cmd_key    "$@" ;;
   read)   shift; cmd_read   "$@" ;;

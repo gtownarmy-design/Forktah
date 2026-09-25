@@ -216,6 +216,9 @@ run test_notify.py python3 dashboard/test_notify.py
 run test_runcards.py python3 dashboard/test_runcards.py
 # The orchestrator warrant: what it permits, and everything it must still refuse.
 run test_warrant.py python3 dashboard/test_warrant.py
+# Team files (agentmux teamfile): validation, the up plan, and the spawn flags that
+# `orchestrator start` shares with it.
+run test_teamfile.py python3 dashboard/test_teamfile.py
 # EP-015 suites are registered at the scaffold seam before their owning tasks land.
 # Missing suites are explicit skips during the staged build; present suites use
 # the same failure accounting as every existing suite above.

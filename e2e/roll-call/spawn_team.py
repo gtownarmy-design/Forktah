@@ -13,7 +13,6 @@ Run from anywhere inside WSL:
 """
 
 import argparse
-import os
 import subprocess
 import sys
 import tempfile
@@ -22,23 +21,12 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "taskmgmt"))
 import agentdefs  # noqa: E402
+# The flags live in one place now, shared with `agentmux teamfile` and
+# `agentmux orchestrator start`. A standing team would use a team file instead
+# (docs/TEAMFILE.md); this script stays as the recorded 2026-09-24 procedure.
+from teamfile import spawn_argv  # noqa: E402
 
 TEAM = ("rollcall-lead", "rollcall-dev", "rollcall-imager", "rollcall-reviewer")
-
-
-def spawn_argv(spec, cwd):
-    posture = spec.posture
-    # The machine-wide brake, applied the way boardteams.hire applies it.
-    if os.environ.get("AGENTMUX_NO_BYPASS") == "1" and posture == "unrestricted":
-        posture = "workspace-write"
-    argv = ["agentmux", "spawn", spec.name, "--cli", spec.cli, "--cwd", cwd,
-            "--agentdef", spec.name, "--posture", posture, "--role", spec.role]
-    for flag, value in (("--model", spec.model), ("--auth", spec.auth),
-                        ("--tools", ",".join(spec.tools)),
-                        ("--deny-tools", ",".join(spec.tools_deny))):
-        if value:
-            argv += [flag, value]
-    return argv
 
 
 def main():

@@ -74,6 +74,18 @@ done
 check "a bad line does not stop the good one after it" "good 7200" \
       "$(candidates "$(printf 'bad line here\ngood %s 0\n' "$((NOW - 7200))")")"
 
+echo '--- an agent spawned with the timeout off stays exempt ---'
+# The watchdog is one process, started by whichever spawn came first, with THAT spawn's
+# limit. A reviewer spawned with AGENTMUX_IDLE_MINUTES=0 and waiting an hour for its
+# first draft must survive a watchdog somebody else's spawn started (TM-131).
+SAVED_RUNDIR="$RUNDIR"; RUNDIR="$(mktemp -d)"
+: > "$RUNDIR/reviewer.noidle"
+check "a .noidle agent is never closed, however idle" "" \
+      "$(candidates "reviewer $((NOW - 86400)) 0")"
+check "while an idle neighbour without the marker still is" "other 86400" \
+      "$(candidates "$(printf 'reviewer %s 0\nother %s 0\n' "$((NOW - 86400))" "$((NOW - 86400))")")"
+rm -rf "$RUNDIR"; RUNDIR="$SAVED_RUNDIR"
+
 echo '--- the timeout can be turned off, and says so ---'
 out="$(AGENTMUX_IDLE_MINUTES=0 IDLE_MINUTES=0 cmd_idle 2>&1)"
 check "0 disables it" "idle timeout disabled (AGENTMUX_IDLE_MINUTES=0)" "$out"
