@@ -64,15 +64,18 @@ const text = (sel) => page.textContent(sel);
 
 // ── the rail ────────────────────────────────────────────────────────────────
 
-await test('the rail has exactly the seven views, in order', async () => {
+await test('the rail has exactly the eight views, in order', async () => {
+  // Runs sits directly after Board because a run is what a board card becomes once
+  // someone starts working on it, and the order is asserted rather than sorted so a
+  // new entry has to be placed deliberately instead of landing wherever.
   const labels = await page.$$eval('.nav-item .nav-label', (ns) => ns.map(n => n.textContent));
-  assert.deepEqual(labels, ['Terminals', 'Status', 'Board', 'Organization', 'IIOT',
-                            'GitHub', 'Settings']);
+  assert.deepEqual(labels, ['Terminals', 'Status', 'Board', 'Runs', 'Organization',
+                            'IIOT', 'GitHub', 'Settings']);
 });
 
 await test('every rail button reveals its view and hides the others', async () => {
-  for (const view of ['status', 'board', 'organization', 'iiot', 'github', 'settings',
-                      'terminals']) {
+  for (const view of ['status', 'board', 'runs', 'organization', 'iiot', 'github',
+                      'settings', 'terminals']) {
     await show(view);
     const visible = await page.$$eval('.views > .view',
       (ns) => ns.filter(n => !n.hidden).map(n => n.id));
@@ -500,6 +503,13 @@ await test('Board carries Tasks and Atlassian, and Atlassian says how to set it 
       await page.$$eval('[data-tabs="board"] .subtab', ns => ns.map(n => n.textContent)),
       ['Tasks', 'Atlassian']);
     await tab('board', 'tickets');
+    // WAIT for the panel rather than reading it the instant the tab is clicked. The
+    // loader is a fetch, so asserting immediately was a race this test happened to
+    // win - until anything else on the page competed for a connection, at which
+    // point it failed while the panel was working perfectly.
+    await page.waitForFunction(
+      () => /not configured|issue/i.test(document.querySelector('#viewTickets')?.textContent || ''),
+      null, { timeout: 15000 });
     const body = await text('#viewTickets');
     assert.match(body, /not configured|issue/i);
     await tab('board', 'boardtasks');
@@ -538,6 +548,11 @@ await test('dragging a task onto another epic refiles it for real', async () => 
   const epics = await page.$$eval('#boardList details.epic', ns => ns.map(n => n.dataset.epic));
   const [from, to] = epics.filter(Boolean);
   assert.ok(from && to, 'need two epics with keys');
+  // Both open before touching them. A collapsed epic renders no .task-row and has no
+  // bounding box to drop onto, so this waited 30s for something that could not appear.
+  // Which epics are open is remembered in localStorage and driven by the collapse-all
+  // test above - a sibling's UI state, which no test should depend on.
+  await page.$$eval('#boardList details.epic', ns => ns.forEach(n => { n.open = true; }));
   await page.fill(`#boardList details.epic[data-epic="${from}"] input[placeholder="new task"]`,
                   'E2E draggable task');
   await page.click(`#boardList details.epic[data-epic="${from}"] button:has-text("add task")`);
@@ -606,8 +621,12 @@ await test('Settings carries the Atlassian card and the theme importer', async (
   await show('settings');
   const keys = await page.$$eval('#viewSettings details.card',
     ns => ns.map(n => n.dataset.collapseKey));
+  // Orchestration is INSERTED between auth and resources, never reordered - the order
+  // is asserted here precisely so a card cannot quietly move. It sits beside Auth
+  // because both answer "what is this machine permitted to do".
   assert.deepEqual(keys, ['settings:feed', 'settings:appearance', 'settings:atlassian',
-                          'settings:auth', 'settings:resources']);
+                          'settings:auth', 'settings:orchestration',
+                          'settings:resources']);
   await page.waitForFunction(
     () => document.getElementById('atlState')?.childElementCount > 0, null, { timeout: 20000 });
   assert.ok(await page.$('#jiraBase'), 'the Jira site field moved here from the ribbon');
@@ -700,7 +719,17 @@ async function withRoster(target, names) {
       cwd: '/tmp', perms: 'UNRESTRICTED', started: new Date().toISOString(),
     }));
     body.tmux_server = true;
-    await route.fulfill({ response, json: body });
+    // Fulfilled EXPLICITLY, not as `{response, json}`. Passing both was accepted by
+    // Playwright 1.62 and silently stopped overriding the body in 1.63, so these four
+    // tests passed against the Windows package in the npx cache and timed out against
+    // the Linux one - a version difference masquerading as a product bug. The body is
+    // being replaced wholesale anyway; the fetched response is only here so the stub
+    // keeps the real payload's shape if it gains fields.
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(body),
+    });
   });
 }
 
@@ -709,13 +738,26 @@ await test('a running agent is marked and a finished one is not', async () => {
   await show('board');
   await tab('board', 'boardtasks');
   const epic = await page.$eval('#boardList details.epic[data-epic]', (n) => n.dataset.epic);
+  // OPEN IT FIRST, and wait inside ITS OWN subtree below.
+  //
+  // A collapsed epic renders no task rows, so the old whole-board textContent check
+  // could never see the name and timed out at 15s with nothing to say. Whether it was
+  // open depended on what an earlier test had left in localStorage - the collapse-all
+  // test drives exactly that, three tests earlier - which made this pass on one
+  // machine and hang on another. A test that reads a sibling's UI state is not
+  // testing what it claims to.
+  await page.$eval(`#boardList details.epic[data-epic="${epic}"]`, (n) => { n.open = true; });
   for (const who of [LIVE, DEAD]) {
     await page.fill(`#boardList details.epic[data-epic="${epic}"] input[placeholder="new task"]`,
                     `task for ${who}`);
     await page.fill(`#boardList details.epic[data-epic="${epic}"] input[placeholder="agent"]`, who);
     await page.click(`#boardList details.epic[data-epic="${epic}"] button:has-text("add task")`);
-    await page.waitForFunction((n) => document.querySelector('#boardList')?.textContent.includes(n),
-                              who, { timeout: 15000 });
+    await page.waitForFunction(
+      ([key, n]) => {
+        const card = document.querySelector(`#boardList details.epic[data-epic="${key}"]`);
+        if (card && !card.open) card.open = true;   // a redraw can re-collapse it
+        return card?.textContent.includes(n);
+      }, [epic, who], { timeout: 25000 });
   }
   await withRoster(page, [LIVE]);
   // Force the poll that owns the roster, then let the board redraw.
@@ -801,13 +843,164 @@ await test('every renderer that names an agent tags it', async () => {
   }
 });
 
+// ── Runs, and the gate that waits for a person ─────────────────────────────
+//
+// The harness seeded two runs: e2e001 with every job verified and nothing left but an
+// operator's decision, and e2e002 still in flight with a worker that never existed.
+// Between them they cover both shapes this view has to draw.
+
+await test('Runs lists what is in flight and says what is blocking each one', async () => {
+  await show('runs');
+  await page.waitForFunction(
+    () => document.querySelectorAll('#viewRuns details.run').length >= 2,
+    null, { timeout: 15000 });
+  const ids = await page.$$eval('#viewRuns .run-id', ns => ns.map(n => n.textContent));
+  assert.ok(ids.includes('e2e001') && ids.includes('e2e002'), `saw ${ids.join(', ')}`);
+  // The blocking line is the product here: a job table answers eventually, one
+  // sentence answers at a glance.
+  const blocking = await page.$$eval('#viewRuns .run-blocking', ns => ns.map(n => n.textContent));
+  assert.ok(blocking.some(t => /e2e002\/1 submitted, waiting on e2e-reviewer/.test(t)),
+            `no blocking line named the reviewer: ${blocking.join(' | ')}`);
+  assert.ok(blocking.every(t => !/e2e001/.test(t)),
+            'a fully verified run must not claim to be blocked');
+});
+
+await test('an attempt count is always shown against its ceiling', async () => {
+  // "tries=2" means nothing without the maximum, and the maximum is MAX_ATTEMPTS in
+  // run.py - served in the payload so raising it there cannot leave this reading 2/3.
+  await page.waitForFunction(
+    () => document.querySelector('#viewRuns table.run-jobs .j-tries'),
+    null, { timeout: 15000 });
+  const tries = await page.$$eval('#viewRuns .j-tries', ns => ns.map(n => n.textContent));
+  assert.ok(tries.length, 'no job rows rendered');
+  for (const value of tries) assert.match(value, /^\d+\/\d+$/);
+});
+
+await test('worker and reviewer cells are tagged for the live-agent marking', async () => {
+  // Open every run card and wait for its job table. A card's open state is remembered
+  // in localStorage, so which ones are expanded depends on what ran before - the same
+  // cross-test dependency that made the live-agent tests above pass on one machine and
+  // hang on another. Assert against all of them, not whichever happened to be open.
+  await page.$$eval('#viewRuns details.run', ns => ns.forEach(n => { n.open = true; }));
+  await page.waitForFunction(
+    () => document.querySelectorAll('#viewRuns table.run-jobs tr.job').length >= 3,
+    null, { timeout: 25000 });
+  const tagged = await page.$$eval('#viewRuns [data-agent]', ns => ns.map(n => n.dataset.agent));
+  assert.ok(tagged.includes('e2e-worker') && tagged.includes('e2e-reviewer'),
+            `runs tagged ${tagged.join(', ')}`);
+  // None of these agents exist, so none may be marked live or made clickable.
+  const live = await page.$$eval('#viewRuns [data-agent].is-live', ns => ns.length);
+  assert.equal(live, 0, 'a torn-down agent must not be presented as running');
+});
+
+await test('a verified run asks the operator to decide, and shows the diff', async () => {
+  await page.waitForSelector('#viewRuns .run-review.pending', { timeout: 15000 });
+  const ask = await page.$eval('.run-review.pending .run-review-head', n => n.textContent);
+  assert.match(ask, /will not complete this run until you do/);
+  await page.waitForFunction(
+    () => !document.querySelector('.run-diff')?.textContent.startsWith('Loading'),
+    null, { timeout: 15000 });
+  // This run was seeded with a base commit that does not exist, so the view has to say
+  // what it is comparing against rather than quietly showing a different diff.
+  const note = await page.$$eval('.run-review.pending .run-diff-rejected',
+                                 ns => ns.map(n => n.textContent).join(' '));
+  assert.match(note, /predates|against HEAD/i);
+  const files = await page.$eval('.run-diff-files', n => n.textContent);
+  assert.match(files, /dashboard\/runs\.js/);
+});
+
+await test('the rail badge says a run is waiting on you', async () => {
+  await page.waitForFunction(() => !document.getElementById('badgeRuns').hidden,
+                             null, { timeout: 20000 });
+  const badge = await page.$eval('#badgeRuns',
+    n => ({ text: n.textContent, title: n.title }));
+  assert.equal(badge.text, '1');
+  assert.match(badge.title, /e2e001: review/);
+});
+
+await test('a rejection with no reason is refused before it is sent', async () => {
+  // A "request changes" carrying no reason gives the orchestrator nothing to act on,
+  // so it never leaves the page.
+  let posts = 0;
+  await page.route('**/api/runs/*/review', async (route) => { posts += 1; await route.continue(); });
+  try {
+    await page.click('.run-review.pending .run-acts button:not(.primary)');
+    await page.waitForSelector('.runs-notice', { timeout: 10000 });
+    assert.equal(posts, 0, 'an empty rejection was sent to the server');
+    assert.match(await page.$eval('.runs-notice', n => n.textContent), /Say what needs changing/);
+  } finally {
+    await page.unroute('**/api/runs/*/review');
+  }
+});
+
+await test('a half-typed note survives the poll that redraws the view', async () => {
+  // THE BUG THIS EXISTS FOR. This view polls every five seconds and draws itself with
+  // replaceChildren; rebuilding regardless detached the button you were reaching for
+  // and emptied the box you were typing in. You cannot use a review form that
+  // reconstructs itself under your hands twice a minute.
+  const note = await page.$('.run-review.pending .run-note');
+  await note.fill('halfway through a thought');
+  await page.waitForTimeout(7000);            // longer than the 5s poll
+  assert.equal(await page.$eval('.run-review.pending .run-note', n => n.value),
+               'halfway through a thought');
+});
+
+await test('approving records the decision and the run stops asking', async () => {
+  page.once('dialog', (d) => d.accept());
+  await page.click('.run-review.pending .run-acts button.primary');
+  await page.waitForSelector('#viewRuns .run-review.approved', { timeout: 15000 });
+  const head = await page.$eval('.run-review.approved .run-review-head', n => n.textContent);
+  assert.match(head, /Approved by .* the orchestrator may complete this run/);
+  // And the badge clears, because nothing is waiting on the operator any more.
+  await page.waitForFunction(() => document.getElementById('badgeRuns').hidden,
+                             null, { timeout: 20000 });
+});
+
+await test('the server refuses to approve a run whose jobs are unverified', async () => {
+  // The gate is the server's, not the button's - the page merely declines to offer a
+  // control. Prove the refusal survives someone calling the endpoint directly.
+  const out = await page.evaluate(async () => {
+    const r = await fetch('api/runs/e2e002/review', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision: 'approved' }),
+    });
+    return { status: r.status, body: await r.text() };
+  });
+  assert.equal(out.status, 409);
+  assert.match(out.body, /not verified yet/);
+});
+
+await test('runs are read-only over HTTP apart from that one decision', async () => {
+  for (const [path, method] of [['api/runs', 'POST'], ['api/runs/e2e001', 'POST'],
+                                ['api/runs/e2e001/diff', 'POST']]) {
+    const status = await page.evaluate(async ([p, m]) => {
+      const r = await fetch(p, { method: m, headers: { 'Content-Type': 'application/json' },
+                                 body: '{}' });
+      return r.status;
+    }, [path, method]);
+    assert.equal(status, 405, `${method} ${path} should be 405, got ${status}`);
+  }
+});
+
 // ── and the console stayed quiet ───────────────────────────────────────────
 
 await test('the page logged no errors while all of that happened', () => {
   // Failed fetches from panels pointed at absent equipment are the page working,
   // not the page breaking; a thrown exception is not.
+  // "can't establish a connection to the server" is how FIREFOX reports a failed
+  // EventSource - the terminal stream with no agents behind it. Chromium says
+  // "Failed to load resource", which was already exempt. Same event, same
+  // non-failure, different browser wording; the filter only knew one of them.
   const real = consoleErrors.filter(line =>
-    !/Failed to load resource|NetworkError|ERR_CONNECTION|favicon/i.test(line));
+    !/Failed to load resource|NetworkError|ERR_CONNECTION|favicon/i.test(line)
+    && !/can.t establish a connection to the server/i.test(line));
+  // Printed as well as asserted: deepEqual against [] truncates the actual array in
+  // the harness output, so a failure here used to say only that something was logged
+  // and never what - which is the least useful shape a console-error test can take.
+  if (real.length) {
+    console.log('      console errors the page logged:');
+    for (const line of real.slice(0, 8)) console.log('        ' + line.slice(0, 160));
+  }
   assert.deepEqual(real, []);
 });
 

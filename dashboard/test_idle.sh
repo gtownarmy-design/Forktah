@@ -111,7 +111,11 @@ if declare -f agentmux_self >/dev/null; then
     /dev/fd/*|/proc/self/fd/*) bad "a /dev/fd path is never returned" "$found" ;;
     *) ok "a /dev/fd path is never returned" ;;
   esac
-  ( cd / && [ -z "$(agentmux_self 2>/dev/null)" ] ) \
+  # AGENTMUX_REPO must be cleared too, or this does not test what it says: it is the
+  # FIRST candidate agentmux_self tries, so with it set the function correctly finds
+  # the repo from any directory and the assertion fails for the right reason. Run
+  # alone this passed by luck; run after any suite that exports it, it went red.
+  ( cd / && unset AGENTMUX_REPO && [ -z "$(agentmux_self 2>/dev/null)" ] ) \
     && ok "and it refuses rather than guessing when the repo is nowhere to be found" \
     || bad "and it refuses rather than guessing"
 else
@@ -138,6 +142,45 @@ grep -c 'stop_idle_watchdog_if_no_agents' agentmux.sh | {
   [ "$n" -ge 4 ] && ok "every kill path stops it ($n sites)" \
                  || bad "every kill path stops it" "only $n sites"
 }
+
+echo '--- the watchdog does not hold descriptors it was handed ---'
+# WHAT THIS PROTECTS. A detached daemon inherits the whole fd table of whoever started
+# it and keeps those files open for its entire life. dashboard/run_tests.sh takes its
+# single-instance lock with `exec 200>...`, spawns agents, and a run killed before its
+# EXIT handler left this watchdog - and the `sleep` it forks - holding fd 200 forever.
+# Every later run then refused to start, blaming a port conflict that did not exist.
+# It cost two separate investigations before anyone thought to look at the lock.
+grep -q 'CLOSE EVERY DESCRIPTOR' agentmux.sh   && ok "the generated watchdog closes inherited descriptors"   || bad "the generated watchdog closes inherited descriptors" "no fd sweep"
+
+# And behaviourally, which is the part a grep cannot promise: generate the real
+# watchdog, start it holding a lock on a high fd, and ask whether the child kept it.
+FDHOME="$(mktemp -d)"
+RUNDIR="$FDHOME/run"; LOGDIR="$FDHOME/logs"; mkdir -p "$RUNDIR" "$LOGDIR"
+AGENTMUX_IDLE_MINUTES=60 AGENTMUX_REPO="$PWD" start_idle_watchdog >/dev/null 2>&1
+WD="$RUNDIR/.idle-watchdog.sh"
+if [ -f "$WD" ]; then
+  rm -f "$RUNDIR/.idle.pid"
+  probe="$FDHOME/probe.lock"; : > "$probe"
+  ( exec 200>"$probe"
+    AGENTMUX_IDLE_TICK=300 setsid bash "$WD" >/dev/null 2>&1 &
+    printf '%s
+' "$!" > "$FDHOME/pid" )
+  sleep 1
+  wpid="$(cat "$FDHOME/pid" 2>/dev/null || true)"
+  held=unknown
+  if [ -n "$wpid" ] && [ -d "/proc/$wpid/fd" ]; then
+    if ls -l "/proc/$wpid/fd" 2>/dev/null | grep -q 'probe.lock'; then held=yes; else held=no; fi
+  fi
+  [ -n "$wpid" ] && { pkill -P "$wpid" 2>/dev/null; kill "$wpid" 2>/dev/null; }
+  case "$held" in
+    no)  ok "a descriptor held by the spawner does not survive into the watchdog" ;;
+    yes) bad "a descriptor held by the spawner does not survive into the watchdog"              "it is still open in pid $wpid" ;;
+    *)   ok "(no /proc to inspect; the grep above covers the generator)" ;;
+  esac
+else
+  bad "the watchdog script is generated" "start_idle_watchdog wrote nothing"
+fi
+rm -rf "$FDHOME"
 
 echo '--- a timeout closes an agent the same way a person does ---'
 grep -q 'cmd_kill "\$name"' agentmux.sh \

@@ -103,6 +103,13 @@ function page(markup = MARKUP, view = 'status') {
     say: (node, text) => { node.textContent = text; },
     console,
     setInterval: (fn, ms) => { const id = nextTimer++; timers.set(id, {fn, ms}); return id; },
+    // Deferred work is a legitimate thing for a view script to do - runs.js
+    // delays its first background poll so it does not compete with the page's
+    // own load - and without this stub the sandbox threw on registration.
+    // Never fired: this harness tests that scripts REGISTER cleanly.
+    setTimeout: (fn, ms) => { const id = nextTimer++; timers.set(id, {fn, ms}); return id; },
+    clearTimeout: (id) => timers.delete(id),
+    clearInterval: (id) => timers.delete(id),
     clearInterval: (id) => { timers.delete(id); },
     requestAnimationFrame: (fn) => fn(),
     localStorage: {
@@ -421,6 +428,9 @@ test('every view script registers itself without throwing', () => {
     VIEW_LOADERS: {}, VIEW_POLL_MS: {},
     say: () => {},
     setInterval: () => 1,
+    setTimeout: () => 1,
+    clearTimeout: () => {},
+    clearInterval: () => {},
     clearInterval: () => {},
     requestAnimationFrame: (fn) => fn(),
     localStorage: {getItem: (k) => store.get(k) ?? null, setItem: (k, v) => store.set(k, v)},
@@ -496,9 +506,19 @@ test('every view script registers itself without throwing', () => {
   assert.deepEqual(registered.panels.sort(), [
     ['organization', 'agents'], ['organization', 'teams'], ['status', 'chatter'],
   ].sort(), 'Agents, Teams and Chatter must land as tabs');
-  assert.deepEqual(registered.views, ['github'], 'GitHub is the only remaining extra view');
-  assert.equal(registered.cards.length, 5, 'five IIOT cards: modbus, dcp, mqtt, scan, codesys');
-  assert.ok(registered.cards.every(v => v === 'iiot'));
+  // Runs is a VIEW rather than a fifth Status tab, and that was a real choice: a tab
+  // would have to share the Status column with the feed and cramp the per-run job
+  // table, which is the thing you go there to read. The cost is one more rail entry.
+  assert.deepEqual(registered.views.sort(), ['github', 'runs'],
+                   'GitHub and Runs are the views registered by their own scripts');
+  // Five IIOT field cards plus the Settings > Orchestration card, which runs.js
+  // registers so that app.js and teams.js do not have to change to gain it.
+  assert.deepEqual(registered.cards.slice().sort(),
+                   ['iiot', 'iiot', 'iiot', 'iiot', 'iiot', 'settings'],
+                   'five IIOT cards and one Settings card');
+  // Superseded by the deepEqual above, which names every card and its view - a
+  // strictly stronger check than 'they are all iiot', and one that does not have
+  // to be relaxed each time a card lands on another view.
 
   // And the registries actually took them.
   const registry = vm.runInContext('VIEW_TABS', ctx);

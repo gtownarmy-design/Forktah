@@ -84,3 +84,21 @@ The workstation's ticket-board scripts were out of scope for this branch, as was
 itself. They duplicate CControlCenter's board, dispatch, pool and agentmux: plugin patches,
 WSL lead and reviewer keepalive, dashboard keepalive, and the `tm` WSL link. Nothing on
 that machine was retired by this integration.
+
+## Upstream sync, 2026-09-24 (TM-114)
+
+`origin/main` (controlLogix, 843d721) was merged into Forktah `main`. It brings run watching
+and the operator-approval gate in front of `run complete`, notifications (`taskmgmt/notify.py`),
+the warranted orchestrator in its own pane (`agentmux orchestrator start|stop|status`,
+`.agentmux/agents/ccc-orchestrator.md`), the dashboard's Runs view (`runs.js`, `runsview.py`),
+and fixes to journal feed starvation and to stale test-suite locks. Git merged it without
+conflicts. Five files were changed on both sides: `README.md`, `agentmux.sh`, and in
+`dashboard/`, `index.html`, `run_tests.sh` and `style.css`.
+
+Where Forktah differs from upstream on purpose:
+- `ccc-orchestrator` runs `cli: claude`, not codex. On this box the WSL CLIs are claude and
+  grok, both with subscription sign-in, and codex is not installed. Cross-model review
+  pairs claude with grok.
+- `run_tests.sh` also registers the Forktah suites (roll call, voice MCP, bytedesk import,
+  ccc-board MCP, keepalive) next to upstream's new runsview, notify, runcards and warrant
+  suites.

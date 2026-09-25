@@ -19,6 +19,7 @@ import netscan
 import os
 from pathlib import Path
 import profinet
+import runsview
 import re
 import stat
 import struct
@@ -728,6 +729,20 @@ def feed_snapshot(limit=200):
         entries.append(ccstore.feed_entry(now_iso(), "fault", "error", "dashboard",
                                           f"feed could not read resources: {err}"))
 
+    # 5b. Run notices. ccstore.FEED_SOURCES has carried "run" since the feed was
+    #     written and Settings has shown a "runs" checkbox the whole time, with nothing
+    #     behind either of them - so the one control an operator had for "tell me about
+    #     runs" did nothing. This is what makes it mean something, and it costs no
+    #     frontend change at all.
+    #
+    #     Read from the orchestrator inbox rather than re-folding every ledger: these
+    #     are the notices run.py already decided were worth a person's attention, so
+    #     the feed and the toast cannot disagree about what is worth saying.
+    try:
+        entries.extend(run_notice_entries())
+    except Exception:
+        pass
+
     # 5. Faults the other sources cannot express: messages the courier gave up on.
     #    These are the ones that matter most and were previously visible only by
     #    running `agentmux courier dead`.
@@ -737,9 +752,84 @@ def feed_snapshot(limit=200):
         pass
 
     entries.sort(key=lambda e: e.get("at") or "", reverse=True)
-    return {"generated_at": now_iso(), "entries": entries[:limit],
+    return {"generated_at": now_iso(), "entries": ration(entries, limit),
             "sources": list(ccstore.FEED_SOURCES),
             "severities": list(ccstore.FEED_SEVERITIES)}
+
+
+def ration(entries, limit):
+    """Take the newest `limit`, but never let one source starve the others.
+
+    WHY THIS IS NOT JUST entries[:limit]. The journal and chatter blocks each fetch up
+    to `limit` rows of their own, so a busy day produces several hundred entries newer
+    than anything else the feed knows about - and a plain truncation then drops every
+    other source entirely. Run notices are the sharpest case: there are a handful of
+    them, they are the ones a person is actually waiting on, and they were being cut
+    before anyone saw them. The Settings checkbox for them stayed decorative for a
+    different reason than before, which is not an improvement.
+
+    The client filters by source AFTER this, so anything cut here is invisible no
+    matter what the operator ticks. That is what makes the cut the wrong place to be
+    democratic about recency.
+
+    Each source is guaranteed its newest few; whatever is left over is filled by
+    recency across everything, so a quiet system still reads as one chronological
+    stream and nothing is reordered.
+    """
+    if len(entries) <= limit:
+        return entries
+    reserve = max(5, limit // (len(ccstore.FEED_SOURCES) * 2))
+    picked, seen = [], {}
+    for entry in entries:                      # already newest-first
+        source = entry.get("source")
+        if seen.get(source, 0) < reserve:
+            seen[source] = seen.get(source, 0) + 1
+            picked.append(id(entry))
+    keep = set(picked[:limit])
+    out = [e for e in entries if id(e) in keep]
+    for entry in entries:                      # fill the rest by pure recency
+        if len(out) >= limit:
+            break
+        if id(entry) not in keep:
+            out.append(entry)
+    out.sort(key=lambda e: e.get("at") or "", reverse=True)
+    return out[:limit]
+
+
+def run_notice_entries(cap=40):
+    """The run notices a person was meant to see, as feed lines.
+
+    Read-only and bounded, like dead_letter_entries beside it. The inbox is run.py's
+    file; this never claims, truncates or marks anything read - `agentmux run notices`
+    owns that, and a reader that quietly consumed them would mean opening the dashboard
+    silently cleared the terminal's copy.
+    """
+    path = HOME_DIR / "inbox" / "orchestrator.jsonl"
+    out = []
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return out
+    for line in raw.splitlines()[-cap:]:
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        body = str(row.get("body") or "")
+        # "kind" here is the inbox's own vocabulary (error/status), not the journal's.
+        # A notice about a run that needs review is a warning, not a failure - see the
+        # same distinction in run.record_notice.
+        severity = "error" if row.get("kind") == "error" else "info"
+        if "waiting on your review" in body:
+            severity = "warn"
+        out.append(ccstore.feed_entry(row.get("at"), "run", severity,
+                                      str(row.get("ref") or "run"), body,
+                                      row.get("ref")))
+    return out
 
 
 def dead_letter_entries(cap=40):
@@ -1138,6 +1228,70 @@ class Handler(BaseHTTPRequestHandler):
                     "link", "triage", "state", "config", "override",
                     "agentdef", "agentdrop", "recruit", "approve", "hire",
                     "plcstate", "bootapp", "chatsend")
+
+    def runs_endpoint(self, rest, query):
+        """Runs, read-only, plus the one write: the operator's review decision.
+
+        `rest` is what followed /api/runs - "" for the list, "<id>" for one run,
+        "<id>/diff" for what it changed, "<id>/review" for the decision. Every id is
+        validated by run.valid_run() before it reaches a path join; the six-hex shape
+        is the only thing that ever indexes into ~/.agentmux/runs.
+        """
+        parts = [p for p in rest.split("/") if p] if rest else []
+        try:
+            if not parts:
+                if self.command != "GET":
+                    self.send_json(405, {"error": "read-only endpoint"})
+                    return
+                raw = parse_qs(query).get("limit", ["20"])[0]
+                limit = int(raw) if re.fullmatch(r"[0-9]{1,3}", raw) else 20
+                self.send_json(200, runsview.list_runs(limit))
+                return
+            run_id, tail = parts[0], (parts[1] if len(parts) > 1 else "")
+            if len(parts) > 2 or not runsview.runmod.valid_run(run_id):
+                self.send_json(404, {"error": "not found"})
+                return
+            if tail == "review":
+                # The ONE write here, and it is the human gate in front of
+                # completion - see runsview's approval comment for why an agent
+                # verifying every job is not the same as the work being wanted.
+                if self.command != "POST":
+                    self.send_json(405, {"error": "POST required"})
+                    return
+                body = self.read_cc_body(4096)
+                if body is None:
+                    return
+                decision = body.get("decision")
+                if decision not in ("approved", "changes"):
+                    self.send_json(400, {"error": "decision must be approved or changes"})
+                    return
+                note = body.get("note")
+                if note is not None and not isinstance(note, str):
+                    self.send_json(400, {"error": "note must be a string"})
+                    return
+                # The reviewer is the person at this browser. There is no identity to
+                # check on loopback and pretending otherwise would be theatre; what
+                # matters is that the decision is recorded and attributable to a
+                # surface, which "operator (dashboard)" says honestly.
+                record = runsview.write_approval(run_id, "operator (dashboard)",
+                                                 note, decision)
+                self.send_json(200, {"ok": True, "review": record})
+                return
+            if self.command != "GET":
+                self.send_json(405, {"error": "read-only endpoint"})
+                return
+            if tail == "diff":
+                self.send_json(200, runsview.review_diff(run_id))
+                return
+            if tail:
+                self.send_json(404, {"error": "not found"})
+                return
+            self.send_json(200, runsview.detail(run_id))
+        except runsview.ReviewError as err:
+            # 409, matching the board: the request was well formed and the run said no.
+            self.send_json(409, {"error": str(err)})
+        except (OSError, ValueError) as err:
+            self.send_json(500, {"error": f"runs unavailable ({type(err).__name__})"})
 
     def board_endpoint(self, op, query):
         try:
@@ -2081,6 +2235,14 @@ class Handler(BaseHTTPRequestHandler):
                          and 1 <= int(raw) <= 2000 else 200)
                 self.send_json(200, feed_snapshot(limit))
                 return
+            if path == "/api/runs" or path.startswith("/api/runs/"):
+                # Deliberately NOT under /api/board/, whose op regex is [a-z]{1,16}
+                # with no slash - a run id and a sub-resource would not survive it.
+                # Routed here in the shared block for the same reason /api/feed is:
+                # from the GET-only section a POST falls through to 404, which tells
+                # the caller the endpoint does not exist when it plainly does.
+                self.runs_endpoint(path[len("/api/runs"):].strip("/"), parsed.query)
+                return
             if path == "/api/board" or path.startswith("/api/board/"):
                 op = path[len("/api/board/"):] if len(path) > len("/api/board") else "board"
                 if not re.fullmatch(r"[a-z]{1,16}", op):
@@ -2211,7 +2373,7 @@ class Handler(BaseHTTPRequestHandler):
             content_type = "text/html; charset=utf-8"
         elif path in ("/app.js", "/fitmatrix.js", "/agents.js", "/teams.js", "/iiot.js",
                       "/github.js", "/codesys.js", "/chatter.js", "/mqtt.js",
-                      "/netscan.js"):
+                      "/netscan.js", "/runs.js"):
             # fitmatrix.js is the readability test harness. index.html loads it only
             # when the URL carries ?fit=1, so it is inert on the normal page but can
             # be run against the REAL page rather than a mock.

@@ -645,6 +645,27 @@ cmd_spawn() (
     esac
     env_prefix="$env_prefix set -a; . '$ROOT/env'; set +a;"
   fi
+  # THE ORCHESTRATOR'S WARRANT SECRET, and only for the pane it names.
+  #
+  # Deliberately NOT $ROOT/env, which the block above sources into EVERY pane - that
+  # would hand the credential to every worker on the box and leave only the name
+  # binding standing. Sourced the same way for the same reason: the value never
+  # appears in `ps`, in #{pane_start_command}, or in this script's logs.
+  if [ -f "$ROOT/orchestrator.warrant" ] && [ -f "$ROOT/orchestrator.env" ]; then
+    local warranted
+    warranted="$(python3 -c 'import json,sys
+try:
+    print(json.load(open(sys.argv[1])).get("agent",""))
+except Exception:
+    pass' "$ROOT/orchestrator.warrant" 2>/dev/null)"
+    if [ -n "$warranted" ] && [ "$warranted" = "$name" ]; then
+      case "$(stat -c '%a' "$ROOT/orchestrator.env" 2>/dev/null)" in
+        600|400) env_prefix="$env_prefix set -a; . '$ROOT/orchestrator.env'; set +a;" ;;
+        *) printf "agentmux: %s/orchestrator.env is not mode 0600 - refusing to load it.
+" "$ROOT" >&2; return 1 ;;
+      esac
+    fi
+  fi
   # Auth method. An explicit --auth wins; otherwise use whatever setup_auth.py
   # recorded as this CLI's active method. No method configured means the CLI's own
   # built-in default (an existing OAuth login), which is the pre-existing behaviour.
@@ -2001,6 +2022,25 @@ start_idle_watchdog() {
 # The \`tr -d '\r'\` is not decoration: this repo is checked out with CRLF, so bash
 # refuses agentmux.sh read directly. Every other caller uses process substitution
 # for the same reason.
+
+# CLOSE EVERY DESCRIPTOR WE WERE HANDED EXCEPT stdio.
+#
+# A detached daemon inherits the whole fd table of whoever started it, and it then
+# holds those files open for its entire life - which here means until the last agent
+# exits, potentially days. That is not theoretical: dashboard/run_tests.sh takes its
+# single-instance lock with \`exec 200>...\`, spawns agents, and a run killed before
+# its EXIT handler left this watchdog (and the \`sleep\` it forks) holding fd 200
+# forever. Every later run then refused to start, reporting a port conflict that did
+# not exist, and the only way out was hunting the holder with fuser.
+#
+# Done in the CHILD rather than at each call site so it holds for every caller,
+# including ones that have not been written yet.
+for _fd in /proc/self/fd/*; do
+  _n="\${_fd##*/}"
+  [ "\$_n" -gt 2 ] 2>/dev/null && eval "exec \$_n>&-" 2>/dev/null
+done
+unset _fd _n
+
 while sleep "\${AGENTMUX_IDLE_TICK:-60}"; do
   tmux -L "$SOCKET" list-sessions >/dev/null 2>&1 || break
   bash <(tr -d '\r' < "$script") idle >> "$RUNDIR/.idle.log" 2>&1
@@ -2133,8 +2173,150 @@ cmd_exec() {
   fi
 }
 
+# ── the CCC orchestrator ─────────────────────────────────────────────────────
+#
+# One agent, in its own pane, holding a warrant that lets it call the four verbs an
+# orchestration needs: run start, assign, complete, teardown. Everything else it does -
+# verdicts, claims, board writes - goes through the ordinary identity path and is
+# refused exactly as it would be for any other pane.
+#
+# ONE AT A TIME, enforced against live sessions rather than stored in a file. A second
+# orchestrator is not a concurrency problem to tune, it is two things deciding what is
+# finished, and a number in a config that can disagree with reality is a bug generator.
+
+ORCH_DEFAULT_AGENT="ccc-orchestrator"
+
+orchestrator_live() {
+  # The warranted name, if a pane by that name is actually running.
+  local name; name="$(orchestrator_warranted_name)" || return 1
+  [ -n "$name" ] || return 1
+  have "$name" && printf '%s\n' "$name" && return 0
+  return 1
+}
+
+orchestrator_warranted_name() {
+  [ -f "$ROOT/orchestrator.warrant" ] || return 1
+  python3 -c 'import json,sys
+try:
+    print(json.load(open(sys.argv[1])).get("agent",""))
+except Exception:
+    sys.exit(1)' "$ROOT/orchestrator.warrant" 2>/dev/null
+}
+
+cmd_orchestrator() {
+  local sub="${1:-status}"; shift 2>/dev/null || true
+  case "$sub" in
+    start)  orchestrator_start "$@" ;;
+    stop)   orchestrator_stop  "$@" ;;
+    status) orchestrator_status "$@" ;;
+    *) printf 'usage: agentmux orchestrator start|stop|status\n' >&2; return 2 ;;
+  esac
+}
+
+orchestrator_status() {
+  local name; name="$(orchestrator_warranted_name 2>/dev/null || true)"
+  if [ -z "$name" ]; then
+    printf 'orchestrator: no warrant issued\n'
+    return 0
+  fi
+  local expires agent_state
+  expires="$(python3 -c 'import json,sys,time
+r=json.load(open(sys.argv[1]))
+left=int(r.get("expires_at",0)-time.time())
+print(f"{left//60}m" if left>0 else "EXPIRED")' "$ROOT/orchestrator.warrant" 2>/dev/null)"
+  if have "$name"; then agent_state="running"; else agent_state="NOT running"; fi
+  printf 'orchestrator: %s (%s), warrant expires in %s\n' "$name" "$agent_state" "$expires"
+}
+
+orchestrator_start() {
+  local name="$ORCH_DEFAULT_AGENT" request="" hours=8
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --agent)   name="${2:-}"; shift 2 ;;
+      --request) request="${2:-}"; shift 2 ;;
+      --hours)   hours="${2:-8}"; shift 2 ;;
+      *) printf 'orchestrator start: unknown option %s\n' "$1" >&2; return 2 ;;
+    esac
+  done
+  [ -n "$request" ] || { printf 'orchestrator start: --request is required - say what it should do\n' >&2; return 2; }
+
+  # ONE AT A TIME. Checked against tmux, not against a file, because a stale file is
+  # exactly how you end up with two.
+  local existing
+  if existing="$(orchestrator_live)"; then
+    printf 'orchestrator: %s is already running. Stop it first:\n  agentmux orchestrator stop\n' "$existing" >&2
+    return 1
+  fi
+
+  printf 'minting a warrant for %s (%sh)...\n' "$name" "$hours"
+  AGENTMUX_HOME="$ROOT" python3 -c 'import sys
+sys.path.insert(0, sys.argv[1])
+import coordination
+coordination.issue_warrant(sys.argv[2], cli=sys.argv[3], hours=float(sys.argv[4]),
+                           issued_by="agentmux orchestrator start")' \
+    "${AGENTMUX_REPO:-$PWD}/taskmgmt" "$name" "shell" "$hours" || {
+      printf 'orchestrator: could not mint a warrant\n' >&2; return 1; }
+
+  # THE CLI COMES FROM THE DEFINITION ON DISK, never from here.
+  #
+  # Hardcoding it was the first version and it was wrong twice over: it named `claude`,
+  # which is a Windows binary and is not on PATH inside WSL where the pane actually
+  # runs, so the spawn would have failed on this machine; and it duplicated a fact that
+  # .agentmux/agents/<name>.md already owns, which is exactly the "only id and name are
+  # read from the wire" bound that keeps the definition authoritative.
+  local cli
+  cli="$(AGENTMUX_REPO="${AGENTMUX_REPO:-$PWD}" python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1] + "/taskmgmt")
+import agentdefs
+spec = agentdefs.resolve(sys.argv[2], sys.argv[1])
+print(getattr(spec, "cli", None) or (spec or {}).get("cli", "") if spec else "")
+' "${AGENTMUX_REPO:-$PWD}" "$name" 2>/dev/null)"
+  if [ -z "$cli" ]; then
+    printf 'orchestrator: no definition for %s in .agentmux/agents/ - revoking
+' "$name" >&2
+    AGENTMUX_HOME="$ROOT" python3 -c 'import sys
+sys.path.insert(0, sys.argv[1]); import coordination; coordination.revoke_warrant()'       "${AGENTMUX_REPO:-$PWD}/taskmgmt" 2>/dev/null
+    return 1
+  fi
+  printf 'spawning %s (%s)...
+' "$name" "$cli"
+
+  # Spawned as --role lead on purpose. dispatch.WORKER_RE is card-scoped and this name
+  # does not match it, so collect/pool ignore the orchestrator for free - no new role
+  # vocabulary to add in five files.
+  if ! cmd_spawn "$name" --cli "$cli" --cwd "${AGENTMUX_REPO:-$PWD}" --role lead; then
+    printf 'orchestrator: spawn failed - revoking the warrant\n' >&2
+    AGENTMUX_HOME="$ROOT" python3 -c 'import sys
+sys.path.insert(0, sys.argv[1]); import coordination; coordination.revoke_warrant()' \
+      "${AGENTMUX_REPO:-$PWD}/taskmgmt" 2>/dev/null
+    return 1
+  fi
+
+  printf '%s\n' "$request" > "$ROOT/run/$name.request" 2>/dev/null || true
+  printf '\norchestrator %s is up. Brief it with:\n  agentmux send %s "<your request>"\n' "$name" "$name"
+  printf 'Watch it: the Runs view in the CCC, or\n  agentmux attach %s\n' "$name"
+}
+
+orchestrator_stop() {
+  local name; name="$(orchestrator_warranted_name 2>/dev/null || true)"
+  # REVOCATION FIRST, then the kill. A pane that survives the kill is then already
+  # powerless, which is the ordering that makes "stop" mean something even when the
+  # kill does not land.
+  AGENTMUX_HOME="$ROOT" python3 -c 'import sys
+sys.path.insert(0, sys.argv[1]); import coordination
+print(" ".join(coordination.revoke_warrant()) or "nothing to revoke")' \
+    "${AGENTMUX_REPO:-$PWD}/taskmgmt" 2>/dev/null || true
+  if [ -n "$name" ] && have "$name"; then
+    cmd_kill "$name"
+  else
+    printf 'orchestrator: no pane to stop\n'
+  fi
+}
+
 case "${1:-}" in
   spawn)  shift; cmd_spawn  "$@" ;;
+  orchestrator) shift; cmd_orchestrator "$@" ;;
   send)   shift; cmd_send   "$@" ;;
   key)    shift; cmd_key    "$@" ;;
   read)   shift; cmd_read   "$@" ;;

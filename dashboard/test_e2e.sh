@@ -35,8 +35,17 @@ find_playwright() {
     printf '%s' "$PLAYWRIGHT_DIR"
     return 0
   fi
+  # A LOCAL install first, and it has to be first. The npx caches below can hold a
+  # WINDOWS playwright build - this repo lives on /mnt/c - whose firefox binary cannot
+  # be launched from WSL. Finding that one made the suite fail with "Executable doesn't
+  # exist" rather than skip, which reads like a broken test rather than a missing
+  # browser. ~/pw is the linux install; prefer it.
+  if [ -d "$HOME/pw/node_modules/playwright" ]; then
+    printf '%s' "$HOME/pw/node_modules/playwright"
+    return 0
+  fi
   local cache
-  for cache in "${LOCALAPPDATA:-}/npm-cache/_npx" "$HOME/.npm/_npx"; do
+  for cache in "$HOME/.npm/_npx" "${LOCALAPPDATA:-}/npm-cache/_npx"; do
     [ -d "$cache" ] || continue
     local found
     found=$(find "$cache" -maxdepth 3 -type d -name playwright 2>/dev/null | head -1)
@@ -53,8 +62,10 @@ PW=$(find_playwright) || {
 SKIP test_e2e: no Playwright installation found.
 
   Install one, then re-run:
-      npx -y @playwright/mcp@latest --help     # unpacks playwright into the npm cache
-      npx playwright install firefox           # fetches the browser itself
+      mkdir -p ~/pw && cd ~/pw && npm init -y && npm install playwright
+      npx playwright install firefox           # the LINUX browser
+
+  A Windows playwright under /mnt/c will be found but cannot launch from WSL.
 
   Or point at an existing one:
       PLAYWRIGHT_DIR=/path/to/node_modules/playwright bash dashboard/test_e2e.sh
@@ -89,6 +100,41 @@ PORT=$(free_port)
 BROKER_PORT=$(free_port)
 
 echo "dashboard: 127.0.0.1:$PORT   broker: 127.0.0.1:$BROKER_PORT   home: $TEST_HOME"
+
+# ONE RUN, ALREADY VERIFIED AND WAITING ON A PERSON.
+#
+# The Runs view has nothing to draw without one, and the state worth exercising in a
+# browser is precisely the one a suite cannot reach by clicking: every job passed
+# review, so the run is sitting at the operator gate. Seeded here rather than in the
+# .mjs because it is filesystem state under AGENTMUX_HOME, which is this script's job.
+AGENTMUX_HOME="$TEST_HOME" python3 - <<'SEEDRUN'
+import sys
+sys.path.insert(0, 'taskmgmt')
+import run
+rid = "e2e001"
+run.run_dir(rid).mkdir(parents=True, exist_ok=True)
+run.append_event(rid, {"event": "start", "by": "orchestrator",
+                       "base": "0" * 40,      # no such commit: exercises the fallback
+                       "detail": "e2e: a run waiting on the operator"})
+for i in (1, 2):
+    job = f"{rid}/{i}"
+    run.append_event(rid, {"event": "assign", "job": job, "by": "orchestrator",
+                           "worker": "e2e-worker", "reviewer": "e2e-reviewer",
+                           "task": "TM-E2E"})
+    run.append_event(rid, {"event": "submit", "job": job, "by": "e2e-worker",
+                           "files": ["dashboard/runs.js"]})
+    run.append_event(rid, {"event": "verdict", "job": job, "by": "e2e-reviewer",
+                           "result": "pass", "attempt": 1, "detail": "ran it"})
+# A second run that is still blocked, so the view has both shapes to draw.
+rid2 = "e2e002"
+run.run_dir(rid2).mkdir(parents=True, exist_ok=True)
+run.append_event(rid2, {"event": "start", "by": "orchestrator",
+                        "detail": "e2e: a run still in flight"})
+run.append_event(rid2, {"event": "assign", "job": f"{rid2}/1", "by": "orchestrator",
+                        "worker": "e2e-ghost", "reviewer": "e2e-reviewer"})
+run.append_event(rid2, {"event": "submit", "job": f"{rid2}/1", "by": "e2e-ghost",
+                        "files": ["x.txt"]})
+SEEDRUN
 
 AGENTMUX_HOME="$TEST_HOME" python3 dashboard/server.py --port "$PORT" >"$TEST_HOME/server.log" 2>&1 &
 SERVER_PID=$!

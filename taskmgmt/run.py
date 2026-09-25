@@ -44,17 +44,20 @@ import os
 import re
 import secrets
 import subprocess
+import tempfile
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import coordination                                    # noqa: E402  reuse, do not restate
+import coordination
+import notify                                    # noqa: E402  reuse, do not restate
 
 ROOT = Path(os.environ.get("AGENTMUX_HOME", str(Path.home() / ".agentmux")))
 RUNS_DIR = ROOT / "runs"
 INBOX_DIR = ROOT / "inbox"
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
 RUN_PATTERN = re.compile(r"[0-9a-f]{6}")
 JOB_PATTERN = re.compile(r"([0-9a-f]{6})/([0-9]{1,4})")
 NAME_PATTERN = coordination.NAME_PATTERN
@@ -178,11 +181,17 @@ def fold(events):
     """Derive every job's current state from the log. Never reads stored state."""
     jobs = {}
     request = None
+    base = None
+    origin = None
+    pane = None
     forced = False
     for event in events:
         kind = event.get("event")
         if kind == "start":
             request = event.get("detail")
+            base = event.get("base") or base
+            origin = event.get("origin") or origin
+            pane = event.get("pane") or pane
             continue
         if kind == "forced":
             forced = True
@@ -216,7 +225,27 @@ def fold(events):
         elif kind == "escalate":
             row["state"] = "escalated"
             row["detail"] = event.get("detail")
-    return {"request": request, "jobs": jobs, "forced": forced}
+    return {"request": request, "base": base, "origin": origin, "pane": pane,
+            "jobs": jobs, "forced": forced}
+
+
+def repo_head(repo=None):
+    """The commit this run starts from, or None outside a repo.
+
+    WHY IT IS RECORDED AT ALL. A reviewer - human or agent - asked to look at what a
+    run changed needs a base to compare against, and `git diff HEAD` is not it: the
+    moment a worker commits, that diff goes empty and the review surface shows nothing
+    while the work is sitting right there in the history. Pinning the starting commit
+    makes "what did this run change" answerable for the whole life of the run and
+    afterwards, whether or not anything was committed along the way.
+    """
+    try:
+        proc = subprocess.run(["git", "-C", str(repo or Path.cwd()), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = (proc.stdout or "").strip()
+    return sha if proc.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", sha) else None
 
 
 def digest(repo, files):
@@ -233,9 +262,146 @@ def digest(repo, files):
     return out
 
 
+# ── the operator's approval, which the gate consults ─────────────────────────
+#
+# WHY THIS GATE EXISTS ON TOP OF THE REVIEWER GATE. A reviewer verdict answers "was
+# the job done as briefed". It cannot answer "was that the right job", because the
+# same orchestrator wrote the brief the reviewer checked against - so an orchestrator
+# that misreads what was wanted produces a run where every job passes review and the
+# whole thing is wrong. Only the person who asked for the work can catch that, and the
+# last moment they can catch it is before the run is declared finished.
+#
+# THE APPROVAL PINS BYTES. digest() above exists because a verdict naming files without
+# hashing them describes bytes that may since have changed. Approval has the same
+# exposure and a worse consequence, being the final gate: without the pin, work could
+# be approved and then quietly changed before completion, and "approved" would only
+# ever have meant "approved something".
+
+APPROVAL_VERSION = 1
+NOTE_MAX = 2000
+
+
+def approval_path(run_id):
+    return run_dir(run_id) / "APPROVAL.json"
+
+
+def submitted_files(state):
+    """Every file any job in this run submitted, deduplicated, in job order."""
+    out = []
+    for _, row in sorted(state["jobs"].items()):
+        for name in row.get("files") or []:
+            if isinstance(name, str) and name and name not in out:
+                out.append(name)
+    return out
+
+
+def load_approval(run_id):
+    try:
+        value = json.loads(approval_path(run_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def write_approval(run_id, by, note, decision="approved", repo=None):
+    """Record the operator's decision. Atomic: a torn approval is a half-open gate."""
+    if decision not in ("approved", "changes"):
+        raise ValueError(f"unknown decision {decision!r}")
+    if not valid_run(run_id):
+        raise ValueError(f"invalid run id {run_id!r}")
+    directory = run_dir(run_id)
+    if not directory.is_dir():
+        raise ValueError(f"no such run {run_id}")
+    if complete_path(run_id).exists():
+        raise ValueError(f"run {run_id} is already complete - nothing left to approve")
+    state = fold(load_events(run_id))
+    if not state["jobs"]:
+        raise ValueError("no jobs in this run - nothing to review")
+    if decision == "approved":
+        blocking = sorted(j for j, r in state["jobs"].items() if r["state"] in BLOCKING)
+        if blocking:
+            # Approving unverified work would wave through exactly what the reviewer
+            # gate catches. The two reviews are not interchangeable: the reviewer
+            # checks the job was done, the operator checks it was worth doing.
+            raise ValueError(
+                f"{len(blocking)} job(s) are not verified yet: {', '.join(blocking)}. "
+                "Approval is the gate after review, not instead of it.")
+    record = {"version": APPROVAL_VERSION, "run": run_id, "decision": decision,
+              "by": by, "at": now(), "note": (note or "")[:NOTE_MAX],
+              "files": digest(str(repo or REPO_ROOT), submitted_files(state))}
+    handle, tmp = tempfile.mkstemp(dir=str(directory), prefix=".approval-")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as fh:
+            json.dump(record, fh, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, approval_path(run_id))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    append_event(run_id, {"event": "review", "by": by, "result": decision,
+                          "detail": (note or "")[:DETAIL_MAX]})
+    return record
+
+
+def approval_drift(run_id, repo=None):
+    """Files that moved since approval. () means it still holds; None means there is
+    no standing approval to hold."""
+    record = load_approval(run_id)
+    if not record or record.get("decision") != "approved":
+        return None
+    pinned = record.get("files") or {}
+    current = digest(str(repo or REPO_ROOT), sorted(pinned))
+    return tuple(sorted(name for name, was in pinned.items()
+                        if current.get(name) != was))
+
+
+def approval_blocks_completion(run_id, repo=None, agent=None):
+    """Why this run may not complete yet, or None. Consulted by the gate.
+
+    TWO DIFFERENT CALLERS, two different rules, and the difference is the whole point.
+
+    A PERSON at a terminal is the approval. Demanding they first click a button in a
+    browser to approve work they are in the middle of finishing would be ceremony, so
+    for them this refuses only a decision that was MADE and defied: changes asked for,
+    or an approval that no longer covers the bytes on disk.
+
+    AN ORCHESTRATOR must have one. It wrote the brief the reviewer checked against, so
+    a passing review only says the job matched the brief - it cannot say the brief was
+    right. If the orchestrator misread what was wanted, every job passes and the run is
+    still wrong, and the only person who can catch that is the one who asked. So a
+    warranted caller needs an explicit approval on record, not merely the absence of an
+    objection.
+    """
+    record = load_approval(run_id)
+    if not record:
+        if agent:
+            return (f"{agent} has not been approved to complete this run.\n"
+                    "  Every job is verified, which says the work matched its brief -\n"
+                    "  and you wrote that brief. Only the operator can say it was the\n"
+                    "  right brief. Approve it in the CCC's Runs view, then retry.")
+        return None
+    if record.get("decision") == "changes":
+        note = (record.get("note") or "").strip()
+        return (f"the operator asked for changes on {record.get('at')}"
+                + (f": {note[:300]}" if note else "")
+                + "\n  Approve the run once the changes are in, or record a new"
+                  " decision.")
+    drift = approval_drift(run_id, repo)
+    if drift:
+        return (f"{len(drift)} file(s) changed after the operator approved this run: "
+                f"{', '.join(drift[:6])}"
+                + ("" if len(drift) <= 6 else f" (+{len(drift) - 6} more)")
+                + "\n  The approval covered different bytes. Have it reviewed"
+                  " again.")
+    return None
+
+
 # ── notification (never the record) ──────────────────────────────────────────
 
-def notify_orchestrator(kind, body, ref=None):
+def notify_orchestrator(kind, body, ref=None, recipient="orchestrator"):
     """Append straight to the orchestrator's inbox.
 
     NOT `agentmux post`. courier.deliver() refuses a self-addressed message, and
@@ -247,15 +413,225 @@ def notify_orchestrator(kind, body, ref=None):
     try:
         INBOX_DIR.mkdir(parents=True, exist_ok=True)
         os.chmod(INBOX_DIR, 0o700)
-        path = INBOX_DIR / "orchestrator.jsonl"
+        safe = recipient if NAME_PATTERN.fullmatch(recipient or "") else "orchestrator"
+        path = INBOX_DIR / f"{safe}.jsonl"
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({
-                "at": now(), "sender": "run", "recipient": "orchestrator",
+                "at": now(), "sender": "run", "recipient": safe,
                 "kind": kind, "body": body[:8192], "ref": ref}) + "\n")
         os.chmod(path, 0o600)
         return True
     except OSError:
         return False
+
+
+# ── the board cards this run was supposed to close ───────────────────────────
+#
+# THE FAILURE THIS EXISTS FOR, exactly. Run bdae05 completed on 2026-09-24 with 2/2
+# jobs verified, printed "COMPLETE", and said nothing about TM-083 - the card it had
+# been assigned. That card sat `open` with five unticked acceptance criteria until
+# somebody noticed by eye, and EP-021 stayed open behind it. Two correct gates with no
+# wire between them: `run complete` knew the task key on every job and never mentioned
+# it, and the board had no idea a run had finished.
+#
+# This is the wire. It only REPORTS - it does not tick acceptance or close anything,
+# because the board's own gate_done is the thing that decides whether a card may close
+# and a second opinion here would be a way around it. What it removes is the silence.
+
+_board = None
+
+
+def board_modules():
+    """(ccstore, ccboard) or None. Never raises: a missing board is not a reason to
+    fail a completion that has already been verified."""
+    global _board
+    if _board is not None:
+        return _board or None
+    directory = str(REPO_ROOT / "dashboard")
+    try:
+        if directory not in sys.path:
+            sys.path.append(directory)      # append, not insert: the dashboard's
+        import ccstore                      # modules must never shadow taskmgmt's
+        import ccboard
+        _board = (ccstore, ccboard)
+    except Exception:
+        _board = False
+        return None
+    return _board
+
+
+def cards_of(state):
+    """Task keys this run's jobs were assigned to, in job order."""
+    out = []
+    for _, row in sorted(state["jobs"].items()):
+        key = row.get("task")
+        if isinstance(key, str) and key and key not in out:
+            out.append(key)
+    return out
+
+
+def card_status(keys):
+    """For each key: its status and what the BOARD says still blocks closing it.
+
+    The gaps come from ccboard.gate_done, so this can never disagree with the refusal
+    an operator would get trying to close the card by hand.
+    """
+    modules = board_modules()
+    if not modules or not keys:
+        return None
+    ccstore, ccboard = modules
+    out = []
+    try:
+        with ccstore.connection() as db:
+            cfg = ccboard.config(db) if hasattr(ccboard, "config") else {}
+            for key in keys:
+                try:
+                    task = ccboard.entity(db, key)
+                except Exception:
+                    out.append({"key": key, "status": "unknown",
+                                "gaps": [], "error": "not on the board"})
+                    continue
+                status = str(task.get("status") or "unknown")
+                gaps = []
+                if status != "done":
+                    # gate_done RAISES Refused; it does not return it. Catching
+                    # Exception and shrugging would have reported every open card with
+                    # no reason attached, which is the silence this whole function
+                    # exists to remove.
+                    try:
+                        ccboard.gate_done(db, task, cfg)
+                    except ccboard.Refused as refusal:
+                        gaps = sorted({g.get("field", "?")
+                                       for g in (refusal.missing or [])})
+                    except Exception:
+                        gaps = []
+                out.append({"key": key, "status": status, "gaps": gaps,
+                            "epic": task.get("epic")})
+    except Exception:
+        return None
+    return out
+
+
+def report_cards(state):
+    """What this run leaves behind on the board.
+
+    Returns (summary_fragment, lines). Computed rather than printed so the caller can
+    put the headline first - the detail belongs under the result, not above it.
+    """
+    keys = cards_of(state)
+    if not keys:
+        return "", []
+    rows = card_status(keys)
+    if rows is None:
+        return "", [f"  cards: {', '.join(keys)} "
+                    f"(board unavailable - check them by hand)"]
+    still_open = [r for r in rows if r["status"] != "done"]
+    if not still_open:
+        return "", [f"  board: all {len(rows)} card(s) already closed - "
+                    f"{', '.join(r['key'] for r in rows)}"]
+    lines = [f"  BOARD: {len(still_open)} of {len(rows)} card(s) are still open:"]
+    for row in still_open:
+        gaps = f" - missing {', '.join(row['gaps'])}" if row["gaps"] else ""
+        note = f" ({row['error']})" if row.get("error") else ""
+        lines.append(f"    {row['key']:<10} {row['status']}{gaps}{note}")
+    lines += ["    A verified run is not a closed card. Tick the acceptance criteria",
+              "    and attach evidence, or the epic behind these stays open too."]
+    return (f"cards still open: {', '.join(r['key'] for r in still_open)}"), lines
+
+
+# ── unread notices, surfaced in whatever terminal asks next ──────────────────
+#
+# THE CASE THIS EXISTS FOR. A tmux pane can be drawn on and a desktop can be toasted.
+# A Claude Code session is neither: it has no tty of its own (each command is a fresh
+# non-interactive process), no pane, and nothing polling on its behalf. So the only
+# honest way to reach it is to leave the message where it will be picked up, and make
+# every subsequent command say so.
+#
+# "Non-blocking" is the whole design. Nothing is injected into anyone's input, nothing
+# waits for acknowledgement, and a terminal that never asks simply never sees it - the
+# ledger and the inbox are still the record. It is a comment, not a prompt.
+
+def unread_path(who):
+    return INBOX_DIR / f"{who}.read"
+
+
+def unread_notices(who=None, cap=20):
+    """Notices this terminal has not been shown yet. Never raises."""
+    who = who or notify.origin_id()
+    if not NAME_PATTERN.fullmatch(who or ""):
+        return []
+    try:
+        lines = [l for l in (INBOX_DIR / f"{who}.jsonl").read_text(
+            encoding="utf-8", errors="replace").splitlines() if l.strip()]
+    except OSError:
+        return []
+    try:
+        seen = int(unread_path(who).read_text(encoding="utf-8").strip() or 0)
+    except (OSError, ValueError):
+        seen = 0
+    out = []
+    # A marker ahead of the file means the inbox was rotated or truncated. Showing
+    # everything again beats silently showing nothing for the rest of time.
+    for line in lines[seen:] if seen <= len(lines) else lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            out.append(row)
+    return out[-cap:]
+
+
+def mark_notices_read(who=None):
+    who = who or notify.origin_id()
+    if not NAME_PATTERN.fullmatch(who or ""):
+        return
+    try:
+        count = len([l for l in (INBOX_DIR / f"{who}.jsonl").read_text(
+            encoding="utf-8", errors="replace").splitlines() if l.strip()])
+        INBOX_DIR.mkdir(parents=True, exist_ok=True)
+        unread_path(who).write_text(str(count), encoding="utf-8")
+        os.chmod(unread_path(who), 0o600)
+    except OSError:
+        pass
+
+
+def print_unread(stream=None):
+    """One compact block, above whatever the command was actually asked to do."""
+    stream = stream or sys.stderr
+    rows = unread_notices()
+    if not rows:
+        return 0
+    who = notify.origin_id()
+    print(f"\n  {len(rows)} notice(s) for this terminal since you last looked:",
+          file=stream)
+    for row in rows:
+        mark = "!!" if row.get("kind") == "error" else " ·"
+        first = (row.get("body") or "").splitlines()[0][:110]
+        print(f"  {mark} {first}", file=stream)
+        if row.get("ref"):
+            print(f"       agentmux run status {row['ref']}", file=stream)
+    print(f"  (clear with: agentmux run notices --read)\n", file=stream)
+    return len(rows)
+
+
+def cmd_notices(args):
+    rows = unread_notices(args.who)
+    if args.json:
+        print(json.dumps({"who": args.who or notify.origin_id(), "notices": rows},
+                         indent=2))
+    elif not rows:
+        print("no unread notices")
+    else:
+        for row in rows:
+            print(f"[{row.get('at', '?')}] {row.get('kind', '?')} "
+                  f"{('(' + row['ref'] + ')') if row.get('ref') else ''}")
+            for line in (row.get("body") or "").splitlines():
+                print(f"  {line}")
+    if args.read:
+        mark_notices_read(args.who)
+        print(f"marked {len(rows)} notice(s) read", file=sys.stderr)
+    return 0
 
 
 # ── serialising the gate ─────────────────────────────────────────────────────
@@ -322,10 +698,48 @@ def record_notice(run_id, kind, subject, body, by, ref=None):
     The ledger is the durable record, so a failure is written THERE as well as said on
     stderr: whatever else is down, the run's own events file is local and already open.
     """
+    # TWO SEPARATE QUESTIONS, and collapsing them was a real mistake in the first draft
+    # of this. "Does it interrupt someone" is not "is it a failure": a run waiting on
+    # your review needs you now, and is the gate working exactly as designed. Shipping
+    # that as an error teaches people that red means nothing, which costs you the
+    # escalations that genuinely are red.
+    interrupts = kind in ("blocked", "conflict", "waiting", "done")
+    severity = ("error" if kind in ("blocked", "conflict")
+                else "warn" if kind == "waiting" else "info")
+    urgent = severity == "error"
     where = coordination.journal(kind, subject, body, by)
-    delivered = notify_orchestrator("error" if kind in ("blocked", "conflict") else "status",
-                                    subject if not body else f"{subject}\n{body}"[:8192],
-                                    ref=ref)
+    message = subject if not body else f"{subject}\n{body}"[:8192]
+    delivered = notify_orchestrator("error" if urgent else "status", message, ref=ref)
+
+    # AND BACK TO WHOEVER ASKED FOR THE WORK.
+    #
+    # The orchestrator inbox is a shared tray; it is not the session that opened this
+    # run and is waiting on the answer. Written as a SECOND copy rather than instead of
+    # the first, because the shared tray is what `agentmux inbox` and the dashboard
+    # already read, and a notice that moved out of it would vanish from both.
+    state = fold(load_events(run_id))
+    origin = state.get("origin")
+    if origin and origin != "orchestrator":
+        notify_orchestrator("error" if urgent else "status", message, ref=ref,
+                            recipient=origin)
+
+    # OUT-OF-PROCESS CHANNELS, and only for what is worth interrupting someone for.
+    # A passing verdict is not. These are bounded and never raise: a toast that could
+    # not be drawn must not be able to stop a run from completing.
+    channels = []
+    if interrupts:
+        try:
+            channels = notify.deliver(
+                subject, body, severity, ref=ref,
+                toast_enabled=os.environ.get("AGENTMUX_NOTIFY_TOAST", "1") != "0",
+                command=os.environ.get("AGENTMUX_NOTIFY_COMMAND", ""),
+                pane=state.get("pane"))
+        except Exception as err:               # never trust an operator-supplied command
+            channels = [{"channel": "notify", "ok": False, "reason": type(err).__name__}]
+    for row in [c for c in channels if not c["ok"]]:
+        print(f"  WARNING: {row['channel']} notification failed: {row['reason']}",
+              file=sys.stderr)
+
     if where.startswith("NOWHERE") or not delivered:
         problem = (f"notification degraded: journal={where}, "
                    f"orchestrator inbox={'ok' if delivered else 'FAILED'}")
@@ -356,7 +770,15 @@ def cmd_start(args):
             continue
         os.chmod(directory, 0o700)
         (directory / "request.md").write_text(args.request, encoding="utf-8")
+        # WHERE THIS WAS ASKED FOR, so a notice can go back to it. The toast reaches
+        # whoever is at this machine's desktop; it does not reach the session holding
+        # the context that knows what the run was for. That session is the one that has
+        # to look when the run stops at the operator gate.
         append_event(run_id, {"event": "start", "by": by,
+                              "base": repo_head(REPO_ROOT),
+                              "via": coordination.orchestrator_pane(),
+                              "origin": notify.origin_id(),
+                              "pane": os.environ.get("TMUX_PANE") or None,
                               "detail": args.request[:DETAIL_MAX]})
         coordination.journal("plan", f"run {run_id} started", args.request[:2000], by)
         print(run_id)
@@ -400,6 +822,7 @@ def cmd_assign(args):
         if args.brief:
             (directory / "brief.md").write_text(args.brief, encoding="utf-8")
         append_event(args.run, {"event": "assign", "job": job, "by": by,
+                                "via": coordination.orchestrator_pane(),
                                 "worker": args.worker,
                                 "reviewer": args.reviewer, "task": args.task,
                                 "detail": (args.brief or "")[:DETAIL_MAX]})
@@ -529,6 +952,31 @@ def cmd_verdict(args):
         after = fold(load_events(run_id))["jobs"][args.job]
 
     print(f"{args.job}: {result} (attempt {attempt}) -> {after['state']}")
+
+    # THE RUN HAS STOPPED AND IS WAITING ON A PERSON.
+    #
+    # This is the notice the operator gate made necessary. Everything else the harness
+    # announces is something that happened; this one is a request, and until it is
+    # answered nothing else moves. Without it the gate turns an orchestration into a
+    # thing that silently stalls the moment nobody happens to be looking at the Runs
+    # view - which is most of the time, because the whole point was not having to watch.
+    #
+    # Fired from the LAST verdict rather than from the orchestrator, so it is true for
+    # a run driven by hand as well as an autonomous one, and so a persona that forgets
+    # to announce itself cannot suppress it.
+    settled = fold(load_events(run_id))
+    if (args.passed and settled["jobs"]
+            and not any(r["state"] in BLOCKING for r in settled["jobs"].values())
+            and not complete_path(run_id).exists()
+            and not load_approval(run_id)):
+        total = len(settled["jobs"])
+        record_notice(run_id, "waiting", f"run {run_id} is waiting on your review",
+                      f"All {total} job(s) verified. Read the diff and approve it "
+                      f"before this run can complete: agentmux run status {run_id}",
+                      by, ref=run_id)
+        print(f"  all {total} job(s) verified - this run now needs YOUR approval "
+              f"before it can complete")
+
     if after["state"] == "escalated":
         message = (f"ESCALATED {args.job} after {MAX_ATTEMPTS} failed reviews. "
                    f"Last reason: {reason[:400]}")
@@ -556,6 +1004,8 @@ def derive_stale(state):
 
 
 def cmd_status(args):
+    if not args.json:
+        print_unread()
     if not valid_run(args.run):
         print(f"run: invalid run id {args.run!r}", file=sys.stderr)
         return 2
@@ -669,6 +1119,41 @@ def cmd_complete(args):
 
         blocking = sorted(j for j, r in state["jobs"].items() if r["state"] in BLOCKING)
 
+        # WHO IS CALLING. None for a person at a terminal, the pane name for a
+        # warranted orchestrator. Both rules below turn on this distinction, so it is
+        # resolved once, first.
+        via = coordination.orchestrator_pane()
+
+        # --FORCE IS NOT THE ORCHESTRATOR'S TO USE, and this is checked FIRST.
+        #
+        # Ordering matters for the message rather than the outcome: an orchestrator
+        # forcing without an approval is refused either way, but "get approval" would
+        # send it off to obtain one and bring it straight back to a second, different
+        # refusal. The flag is never available to it, so say that.
+        #
+        # Without this the whole verification gate is one flag deep for an agent that
+        # decides it has waited long enough, and "FORCED" in a ledger is only a control
+        # if somebody reads ledgers. --force exists for a run whose agents died, which
+        # is an accident a person judges; an autonomous orchestrator meeting that case
+        # should escalate, not overrule.
+        if args.force and via:
+            print(f"REFUSED: --force is not available to {via!r}.", file=sys.stderr)
+            print("  A warranted pane may complete a VERIFIED run; forcing past an "
+                  "unverified one\n  is a person's call. Escalate it instead.",
+                  file=sys.stderr)
+            return 2
+
+        # THE OPERATOR'S DECISION, CHECKED INSIDE THE SAME LOCK AS THE GATE.
+        #
+        # Taken before the verification gate because it outranks it: if the person who
+        # asked for the work has said it is not what they wanted, how many reviewers
+        # passed it is beside the point. --force does not reach here at all for a
+        # warranted caller, and for a person it does not override a stated objection.
+        objection = approval_blocks_completion(args.run, agent=via)
+        if objection:
+            print(f"REFUSED: {objection}", file=sys.stderr)
+            return 1
+
         if blocking and not args.force:
             print(f"REFUSED: {len(blocking)} of {len(state['jobs'])} job(s) are not "
                   f"verified.", file=sys.stderr)
@@ -696,17 +1181,23 @@ def cmd_complete(args):
             return 1
 
         append_event(args.run, {"event": "forced" if blocking else "complete",
-                                "by": by,
+                                "by": by, "via": via,
                                 "detail": f"{len(state['jobs']) - len(blocking)}"
                                           f"/{len(state['jobs'])} verified"})
     verified = len(state["jobs"]) - len(blocking)
     summary = (f"run {args.run} {'FORCED' if blocking else 'COMPLETE'}: "
                f"{verified}/{len(state['jobs'])} jobs verified")
+    # THE WIRE THE EP-021 FAILURE EXPOSED: say what this leaves on the board.
+    cards, card_lines = report_cards(state)
+    if cards:
+        summary += f"; {cards}"
     if blocking:
         summary += f"; unverified: {', '.join(blocking)}; see {report}"
     record_notice(args.run, "done" if not blocking else "conflict",
                   summary, state["request"] or "", by, ref=args.run)
     print(summary)
+    for line in card_lines:
+        print(line)
     if report:
         print(f"  forced report: {report}")
     print("  agents are still running - tear them down with: "
@@ -748,6 +1239,13 @@ def main(argv=None):
     verdict.add_argument("--reason", default="")
     verdict.add_argument("--reason-file", default=None)
     verdict.set_defaults(func=cmd_verdict)
+
+    notices = sub.add_parser("notices")
+    notices.add_argument("--who", default=None)
+    notices.add_argument("--read", action="store_true",
+                         help="mark them read so they stop being surfaced")
+    notices.add_argument("--json", action="store_true")
+    notices.set_defaults(func=cmd_notices)
 
     status = sub.add_parser("status")
     status.add_argument("run")
