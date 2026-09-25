@@ -10,3 +10,10 @@ taskmgmt/recovered/*.bin binary
 # checkout made without core.autocrlf (a WSL clone, CI) still produces runnable files.
 *.cmd                    text eol=crlf
 *.vbs                    text eol=crlf
+
+# Shell scripts are read by bash, which chokes on CR. The suites already run themselves
+# through `tr -d '\r'`, but they SOURCE dashboard/testlib.sh directly, so on a Windows
+# checkout with core.autocrlf=true every shell suite died with "finish: command not
+# found" and the full gate reported 12 suites failed that had never run a check.
+# Pinned LF so this checkout can run its own gate.
+*.sh                     text eol=lf
